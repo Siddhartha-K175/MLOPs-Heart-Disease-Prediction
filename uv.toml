@@ -1,0 +1,2 @@
+# OneDrive/cloud-sync folders break uv's default hardlink mode (os error 396).
+link-mode = "copy"

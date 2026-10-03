@@ -1,0 +1,15 @@
+.venv/
+.git/
+.github/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+mlruns/
+mlflow.db
+data/
+tests/
+.pre-commit-config.yaml
+.dockerignore
+docker-compose.yml
