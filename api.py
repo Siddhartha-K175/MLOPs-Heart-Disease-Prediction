@@ -10,14 +10,17 @@ from __future__ import annotations
 import io
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
+from typing import Annotated
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile
 from fastapi.responses import Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, create_model
 
-from src import database
+from src import auth, database
 from src.advice import recommendations
 from src.model import (
     FEATURE_BOUNDS,
@@ -67,6 +70,26 @@ Patient = create_model(
         Field(None, max_length=500, description="Free-text clinical note stored with the patient."),
     ),
 )
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=64, description="Letters, digits, . - _")
+    password: str = Field(..., min_length=auth.MIN_PASSWORD_LENGTH, max_length=256)
+    name: str = Field(..., min_length=1, max_length=120, description="Patient's full name")
+
+
+class Session(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    username: str
+    role: str = Field(..., description="'admin' or 'patient'")
+    patient_id: str | None = Field(None, description="Linked patient record (patients only)")
+    expires_at: datetime
 
 
 class Guidance(BaseModel):
@@ -187,7 +210,9 @@ def home() -> dict[str, str]:
         "docs": "/docs",
         "endpoints": (
             "GET /health, POST /predict, POST /predict-batch, POST /predict-csv, "
-            "GET /patients, GET /patients/{patient_id}/history, GET /predictions"
+            "POST /auth/register, POST /auth/login, POST /auth/logout, GET /auth/me, "
+            "patient: GET /me/history, "
+            "admin only: GET /patients, GET /patients/{patient_id}/history, GET /predictions"
         ),
         "disclaimer": "Not medical advice. Demo use only.",
     }
@@ -200,15 +225,108 @@ def health() -> dict:
     return {"status": "ok", **metrics}
 
 
+_bearer = HTTPBearer(auto_error=False, description="Token from POST /auth/login")
+BearerToken = Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)]
+
+
+def _unauthorized(detail: str) -> HTTPException:
+    return HTTPException(status_code=401, detail=detail, headers={"WWW-Authenticate": "Bearer"})
+
+
+def optional_account(credentials: BearerToken) -> dict | None:
+    """The signed-in account, or ``None`` when no token is sent; a bad token is rejected."""
+    if credentials is None:
+        return None
+    account = auth.current_session(credentials.credentials)
+    if account is None:
+        raise _unauthorized("Your session has expired or is invalid. Please sign in again.")
+    return account
+
+
+OptionalAccount = Annotated[dict | None, Depends(optional_account)]
+
+
+def require_account(account: OptionalAccount) -> dict:
+    if account is None:
+        raise _unauthorized("Sign-in required.")
+    return account
+
+
+Account = Annotated[dict, Depends(require_account)]
+
+
+def require_admin(account: OptionalAccount) -> dict:
+    """Allow the request only for a signed-in admin."""
+    if account is None:
+        raise _unauthorized("Admin sign-in required to view patient records.")
+    if account["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view other patients' records.")
+    return account
+
+
+
+@app.post("/auth/login", response_model=Session, tags=["auth"])
+def login(credentials: LoginRequest) -> Session:
+    """Exchange a username and password (admin or patient) for a bearer token."""
+    session = auth.login(credentials.username, credentials.password)
+    if session is None:
+        raise _unauthorized("Incorrect username or password.")
+    return Session(**session)
+
+
+@app.post("/auth/register", response_model=Session, status_code=201, tags=["auth"])
+def register(details: RegisterRequest) -> Session:
+    """Patient self-sign-up: creates a new patient record and signs the patient in."""
+    try:
+        auth.register_patient(details.username, details.password, details.name)
+    except ValueError as error:
+        status = 409 if "taken" in str(error) else 422
+        raise HTTPException(status_code=status, detail=str(error)) from error
+    return Session(**auth.login(details.username, details.password))
+
+
+@app.post("/auth/logout", tags=["auth"])
+def logout(account: Account, credentials: BearerToken) -> dict[str, str]:
+    """End the current session."""
+    auth.logout(credentials.credentials)
+    return {"status": "signed out", "username": account["username"]}
+
+
+@app.get("/auth/me", tags=["auth"])
+def me(account: Account) -> dict:
+    """The account the token belongs to."""
+    return {key: account[key] for key in ("username", "role", "patient_id", "name")}
+
+
+@app.get("/me/history", tags=["history"])
+def my_history(account: Account) -> dict:
+    """A signed-in patient's own record and prediction history, newest first."""
+    if account["role"] != "patient":
+        raise HTTPException(
+            status_code=403, detail="Only patient accounts have a personal history."
+        )
+    record = database.get_patient_with_history(account["patient_id"])
+    if record is None:
+        raise HTTPException(status_code=404, detail="Your patient record was not found.")
+    return record
+
+
 @app.post("/predict", response_model=Prediction, tags=["prediction"])
-def predict_single(patient: Patient) -> Prediction:
-    """Score one patient, attach tiered guidance, and store the record in the database."""
+def predict_single(patient: Patient, account: OptionalAccount) -> Prediction:
+    """Score one patient, attach tiered guidance, and store the record in the database.
+
+    A signed-in patient's assessment is always saved to their own record; any
+    identity fields in the body are ignored for them.
+    """
     payload = patient.model_dump()
     scored = _score(pd.DataFrame([payload]))[0]
     scored.guidance = Guidance(
         **recommendations(float(scored.risk_probability), payload)
     )
-    _persist(scored, payload, _identity(patient))
+    identity = _identity(patient)
+    if account and account["role"] == "patient":
+        identity = {"patient_id": account["patient_id"], "name": None, "notes": None}
+    _persist(scored, payload, identity)
     LOGGER.info(
         "saved record_id=%s patient_id=%s", scored.record_id, scored.patient_id
     )
@@ -256,14 +374,14 @@ def predict_csv(file: UploadFile) -> Response:
     return Response(content=output.to_csv(index=False), media_type="text/csv")
 
 
-@app.get("/patients", tags=["history"])
+@app.get("/patients", tags=["history"], dependencies=[Depends(require_admin)])
 def list_patients() -> dict:
     """Every stored patient with prediction counts and latest score time."""
     patients = database.list_patients()
     return {"count": len(patients), "patients": patients}
 
 
-@app.get("/patients/{patient_id}", tags=["history"])
+@app.get("/patients/{patient_id}", tags=["history"], dependencies=[Depends(require_admin)])
 def read_patient(patient_id: str) -> dict:
     """Profile row for one patient id."""
     patient = database.get_patient(patient_id)
@@ -272,7 +390,9 @@ def read_patient(patient_id: str) -> dict:
     return patient
 
 
-@app.get("/patients/{patient_id}/history", tags=["history"])
+@app.get(
+    "/patients/{patient_id}/history", tags=["history"], dependencies=[Depends(require_admin)]
+)
 def patient_history(patient_id: str) -> dict:
     """Full prediction history for one patient, newest first."""
     record = database.get_patient_with_history(patient_id)
@@ -281,7 +401,7 @@ def patient_history(patient_id: str) -> dict:
     return record
 
 
-@app.get("/predictions", tags=["history"])
+@app.get("/predictions", tags=["history"], dependencies=[Depends(require_admin)])
 def recent_predictions(limit: int = Query(50, ge=1, le=200)) -> dict:
     """Most recent predictions across all patients (anonymous rows included)."""
     rows = database.recent_predictions(limit=limit)

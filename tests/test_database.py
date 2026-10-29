@@ -88,6 +88,7 @@ def test_repeat_predictions_append_history_and_update_name(db_schema):
     patients = database.list_patients()
     assert len(patients) == 1
     assert patients[0]["prediction_count"] == 2
+    assert patients[0]["latest_risk"] == pytest.approx(0.8)
 
 
 def test_existing_name_survives_a_resave_without_one(db_schema):

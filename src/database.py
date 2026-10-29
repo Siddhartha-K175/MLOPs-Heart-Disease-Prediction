@@ -213,7 +213,7 @@ def save_prediction(
 
 
 def list_patients(schema: str | None = None) -> list[dict[str, Any]]:
-    """Every patient with prediction counts and the time of their latest score."""
+    """Every patient with prediction counts, latest score time and latest risk."""
     with closing(connect(schema)) as connection:
         rows = connection.execute(
             """
@@ -223,7 +223,13 @@ def list_patients(schema: str | None = None) -> list[dict[str, Any]]:
                 p.notes,
                 p.created_at,
                 COUNT(pr.id)       AS prediction_count,
-                MAX(pr.created_at) AS last_prediction_at
+                MAX(pr.created_at) AS last_prediction_at,
+                (
+                    SELECT latest.risk_probability FROM predictions AS latest
+                    WHERE latest.patient_id = p.patient_id
+                    ORDER BY latest.created_at DESC, latest.id DESC
+                    LIMIT 1
+                )                  AS latest_risk
             FROM patients AS p
             LEFT JOIN predictions AS pr ON pr.patient_id = p.patient_id
             GROUP BY p.patient_id, p.name, p.notes, p.created_at
@@ -282,3 +288,116 @@ def recent_predictions(limit: int = 50, schema: str | None = None) -> list[dict[
             (max(1, min(int(limit), 1000)),),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def save_account(
+    username: str,
+    password_hash: str,
+    role: str,
+    patient_id: str | None = None,
+    schema: str | None = None,
+) -> None:
+    """Create an account, or replace the password of an existing one."""
+    with closing(connect(schema)) as connection:
+        connection.execute(
+            """
+            INSERT INTO accounts (username, password_hash, role, patient_id)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (username) DO UPDATE SET password_hash = EXCLUDED.password_hash
+            """,
+            (username, password_hash, role, patient_id),
+        )
+        # A password change signs the account out everywhere.
+        connection.execute("DELETE FROM sessions WHERE username = %s", (username,))
+        connection.commit()
+
+
+def register_patient(
+    username: str, password_hash: str, name: str, schema: str | None = None
+) -> str:
+    """Create a new patient record and its sign-in account together; returns the id."""
+    patient_id = f"P-{os.urandom(4).hex().upper()}"
+    with closing(connect(schema)) as connection:
+        try:
+            connection.execute(
+                "INSERT INTO patients (patient_id, name) VALUES (%s, %s)", (patient_id, name)
+            )
+            connection.execute(
+                """
+                INSERT INTO accounts (username, password_hash, role, patient_id)
+                VALUES (%s, %s, 'patient', %s)
+                """,
+                (username, password_hash, patient_id),
+            )
+        except psycopg.errors.UniqueViolation as error:
+            raise ValueError("That username is already taken.") from error
+        connection.commit()
+    return patient_id
+
+
+def get_account(username: str, schema: str | None = None) -> dict[str, Any] | None:
+    with closing(connect(schema)) as connection:
+        row = connection.execute(
+            "SELECT username, password_hash, role, patient_id FROM accounts WHERE username = %s",
+            (username,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_accounts(schema: str | None = None) -> list[dict[str, Any]]:
+    with closing(connect(schema)) as connection:
+        rows = connection.execute(
+            """
+            SELECT username, role, patient_id, created_at, last_login_at
+            FROM accounts ORDER BY role, username
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_account(username: str, schema: str | None = None) -> bool:
+    """Delete a sign-in account (the patient's medical record is kept)."""
+    with closing(connect(schema)) as connection:
+        deleted = connection.execute(
+            "DELETE FROM accounts WHERE username = %s", (username,)
+        ).rowcount
+        connection.commit()
+    return deleted > 0
+
+
+def create_session(
+    token_hash: str, username: str, expires_at: Any, schema: str | None = None
+) -> None:
+    """Store a new session and record the login time (expired sessions are pruned)."""
+    with closing(connect(schema)) as connection:
+        connection.execute("DELETE FROM sessions WHERE expires_at <= now()")
+        connection.execute(
+            "INSERT INTO sessions (token_hash, username, expires_at) VALUES (%s, %s, %s)",
+            (token_hash, username, expires_at),
+        )
+        connection.execute(
+            "UPDATE accounts SET last_login_at = now() WHERE username = %s", (username,)
+        )
+        connection.commit()
+
+
+def get_session(token_hash: str, schema: str | None = None) -> dict[str, Any] | None:
+    """The unexpired session for ``token_hash`` with its account's role, or ``None``."""
+    with closing(connect(schema)) as connection:
+        row = connection.execute(
+            """
+            SELECT s.username, s.expires_at, a.role, a.patient_id, p.name
+            FROM sessions AS s
+            JOIN accounts AS a ON a.username = s.username
+            LEFT JOIN patients AS p ON p.patient_id = a.patient_id
+            WHERE s.token_hash = %s AND s.expires_at > now()
+            """,
+            (token_hash,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_session(token_hash: str, schema: str | None = None) -> None:
+    with closing(connect(schema)) as connection:
+        connection.execute("DELETE FROM sessions WHERE token_hash = %s", (token_hash,))
+        connection.commit()

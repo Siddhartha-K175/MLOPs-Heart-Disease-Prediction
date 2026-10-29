@@ -12,7 +12,7 @@ import httpx
 import pandas as pd
 import streamlit as st
 
-from src import database
+from src import auth, database
 from src.advice import recommendations
 from src.model import (
     FEATURE_BOUNDS,
@@ -52,6 +52,12 @@ CSS = """
 .pill.ok::before {content: "\\25CF  "; color: #1E7B4F;}
 .pill.warn::before {content: "\\25CF  "; color: #C27C00;}
 [class*="st-key-card"] {background: #fff; border-radius: 12px;}
+[data-testid="stTextInputRootElement"], [data-testid="stNumberInputContainer"],
+[data-testid="stSelectbox"] [data-baseweb="select"] > div {
+  background-color: #F3F5F8 !important; border: 1px solid #D5DCE4 !important;}
+[data-testid="stTextInputRootElement"] > div, [data-testid="stNumberInputContainer"] > div,
+[data-testid="stTextInputField"], [data-testid="stNumberInputField"] {
+  background-color: transparent !important;}
 .section-title {font-weight: 650; font-size: .95rem; color: #1B2430;}
 .section-sub {font-size: .8rem; color: #5B6675; margin-bottom: .2rem;}
 .risk-card {border-radius: 12px; padding: 1.1rem 1.25rem; border: 1px solid;}
@@ -71,16 +77,23 @@ CSS = """
 .empty {text-align: center; padding: 2.2rem 1rem; color: #5B6675;}
 .empty .icon {font-size: 2rem; color: #C8102E;}
 .footer {font-size: .75rem; color: #7A8594; text-align: center; margin-top: 2rem;}
+.login-hero {text-align: center; margin: 1.5rem 0 1rem;}
+.login-hero .icon {font-size: 2.4rem; color: #C8102E; line-height: 1;}
+.login-hero h2 {margin: .4rem 0 .2rem; font-size: 1.6rem; color: #1B2430;}
+.login-hero p {color: #5B6675; font-size: .92rem; margin: 0;}
 </style>
 """
 
 
 def _call_api(
-    method: str, path: str, payload: dict | None = None
+    method: str, path: str, payload: dict | None = None, token: str | None = None
 ) -> tuple[dict | list | None, str, bool]:
     """Call the FastAPI service. Returns (data, error_message, api_is_offline)."""
+    headers = {"Authorization": f"Bearer {token}"} if token else None
     try:
-        response = httpx.request(method, f"{API_URL}{path}", json=payload, timeout=15.0)
+        response = httpx.request(
+            method, f"{API_URL}{path}", json=payload, headers=headers, timeout=15.0
+        )
     except httpx.HTTPError as error:
         return None, f"API at {API_URL} unreachable ({error.__class__.__name__})", True
     if response.status_code >= 400:
@@ -117,20 +130,106 @@ def _save_locally(values: dict[str, float], identity: dict[str, str | None],
     )
 
 
-def _load_history(patient_id: str) -> tuple[dict | None, str, bool]:
-    """Fetch a patient's history from the API, falling back to Supabase directly."""
-    data, error, offline = _call_api("GET", f"/patients/{quote(patient_id, safe='')}/history")
+def _account_from(session: dict, token: str) -> dict:
+    """Session-state record for a signed-in user."""
+    return {
+        "username": session["username"],
+        "role": session["role"],
+        "patient_id": session.get("patient_id"),
+        "name": session.get("name"),
+        "token": token,
+    }
+
+
+def _sign_in(username: str, password: str, role: str) -> tuple[dict | None, str]:
+    """Sign in through the API, or against Supabase directly when it is down."""
+    data, error, offline = _call_api(
+        "POST", "/auth/login", {"username": username, "password": password}
+    )
     if data is not None:
-        return data, "", False
+        token = data["access_token"]
+        profile, _, _ = _call_api("GET", "/auth/me", token=token)
+        account = _account_from({**data, **(profile or {})}, token)
+    elif not offline:
+        return None, "Incorrect username or password." if "401" in error else error
+    else:
+        try:
+            session = auth.login(username, password)
+            profile = auth.current_session(session["access_token"]) if session else None
+        except (database.DatabaseError, ValueError) as local_error:
+            return None, f"{error}; Supabase sign-in also failed: {local_error}"
+        if session is None:
+            return None, "Incorrect username or password."
+        account = _account_from({**session, **(profile or {})}, session["access_token"])
+
+    if account["role"] != role:
+        # Right password, wrong door: do not leave the session open.
+        _end_session(account["token"])
+        other = "Admin" if account["role"] == "admin" else "Patient"
+        return None, f"This is a {other.lower()} account. Use the {other} tab to sign in."
+    return account, ""
+
+
+def _register(username: str, password: str, name: str) -> tuple[dict | None, str]:
+    """Patient self-sign-up; signs the new patient straight in."""
+    data, error, offline = _call_api(
+        "POST", "/auth/register", {"username": username, "password": password, "name": name}
+    )
+    if data is not None:
+        return _account_from({**data, "name": name.strip()}, data["access_token"]), ""
+    if not offline:
+        return None, error.split(": ", 1)[-1]
+    try:
+        auth.register_patient(username, password, name)
+        session = auth.login(username, password)
+    except (database.DatabaseError, ValueError) as local_error:
+        return None, str(local_error)
+    return _account_from({**session, "name": name.strip()}, session["access_token"]), ""
+
+
+def _end_session(token: str) -> None:
+    _, _, offline = _call_api("POST", "/auth/logout", token=token)
     if offline:
         try:
-            local = database.get_patient_with_history(patient_id)
+            auth.logout(token)
         except (database.DatabaseError, ValueError):
-            local = None
-        if local is not None:
-            return local, f"{error} — read directly from Supabase.", True
-        return None, f"No saved history in Supabase for this patient ({error}).", True
-    return None, error, offline
+            pass
+
+
+def _sign_out() -> None:
+    account = st.session_state.pop("account", None)
+    for key in ("latest_assessment", "last_patient_id"):
+        st.session_state.pop(key, None)
+    if account:
+        _end_session(account["token"])
+
+
+def _signed_in_read(
+    path: str, read_locally, token: str, role: str
+) -> tuple[dict | None, str, bool]:
+    """GET a signed-in API route; when the API is down, check the session and read
+    Supabase directly. Returns (data, note, session_expired)."""
+    data, error, offline = _call_api("GET", path, token=token)
+    if data is not None:
+        return data, "", False
+    if not offline:
+        return None, error, "API error 401" in error
+    try:
+        session = auth.current_session(token)
+        if session is None or session["role"] != role:
+            return None, "Your session has expired.", True
+        local = read_locally()
+    except (database.DatabaseError, ValueError) as local_error:
+        return None, f"{error}; Supabase read also failed: {local_error}", False
+    if local is None:
+        return None, f"404 — not found in Supabase ({error}).", False
+    return local, f"{error} — read directly from Supabase.", False
+
+
+def _expire_session() -> None:
+    st.session_state.pop("account", None)
+    st.session_state["session_expired"] = True
+    st.rerun()
 
 
 def _pct(value: object, digits: int = 0) -> str:
@@ -204,9 +303,9 @@ def _findings(values: dict[str, float]) -> list[str]:
 
 
 def _assess(values: dict[str, float], identity: dict[str, str | None],
-            metrics: dict) -> dict | None:
+            metrics: dict, token: str) -> dict | None:
     """Score through the API (or locally when it is down) and return the result to show."""
-    data, error, offline = _call_api("POST", "/predict", {**values, **identity})
+    data, error, offline = _call_api("POST", "/predict", {**values, **identity}, token=token)
     result = {
         "values": values,
         "assessed_at": datetime.now(),
@@ -302,6 +401,156 @@ def _render_result(result: dict) -> None:
         st.caption(guidance["disclaimer"])
 
 
+def _render_record(record: dict, note: str, *, own: bool) -> None:
+    """A patient's summary, risk trend and assessment table."""
+    patient = record["patient"]
+    if not record["history"]:
+        message = (
+            "You have no saved assessments yet. Run your first one on the "
+            "**New assessment** tab."
+            if own
+            else "This patient exists but has no saved assessments yet."
+        )
+        st.info(message)
+        return
+    history = pd.DataFrame(record["history"])
+    history["created_at"] = _local_times(history["created_at"])
+    history = history.sort_values("created_at", ascending=False)
+    latest = float(history["risk_probability"].iloc[0])
+    previous = float(history["risk_probability"].iloc[1]) if len(history) > 1 else None
+
+    with st.container(border=True, key="card_patient_summary"):
+        st.markdown(f"#### {html.escape(patient.get('name') or patient['patient_id'])}")
+        caption = f"Patient ID `{patient['patient_id']}`"
+        if patient.get("notes") and not own:
+            caption += f" · {patient['notes']}"
+        st.caption(caption)
+        first, second, third = st.columns(3)
+        first.metric("Assessments", record["count"])
+        second.metric(
+            "Latest risk",
+            f"{latest:.0%}",
+            delta=f"{(latest - previous) * 100:+.0f} pts" if previous is not None else None,
+            delta_color="inverse",
+        )
+        third.metric("First assessed", history["created_at"].min().strftime("%d %b %Y"))
+    if note:
+        st.caption(note)
+
+    if len(history) > 1:
+        trend = history.set_index("created_at")[["risk_probability"]] * 100
+        st.line_chart(
+            trend.rename(columns={"risk_probability": "Risk (%)"}),
+            y_label="Risk (%)", height=220,
+        )
+    st.dataframe(
+        history[["created_at", "risk_probability", "risk_label", "trestbps", "chol", "thalach"]],
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "created_at": st.column_config.DatetimeColumn("Assessed", format="D MMM YYYY, HH:mm"),
+            "risk_probability": st.column_config.ProgressColumn(
+                "Risk", min_value=0.0, max_value=1.0, format="percent"
+            ),
+            "risk_label": "Result",
+            "trestbps": st.column_config.NumberColumn("BP (mm Hg)", format="%d"),
+            "chol": st.column_config.NumberColumn("Cholesterol", format="%d"),
+            "thalach": st.column_config.NumberColumn("Peak HR", format="%d"),
+        },
+    )
+
+
+def _sign_in_form(role: str) -> None:
+    with st.form(f"{role}_sign_in", border=False):
+        username = st.text_input("Username", autocomplete="username", key=f"{role}_user")
+        password = st.text_input(
+            "Password", type="password", autocomplete="current-password", key=f"{role}_pass"
+        )
+        submitted = st.form_submit_button("Sign in", type="primary", width="stretch")
+    if submitted:
+        if not username.strip() or not password:
+            st.error("Enter your username and password.")
+            return
+        with st.spinner("Signing in…"):
+            account, error = _sign_in(username, password, role)
+        if account:
+            st.session_state["account"] = account
+            st.rerun()
+        st.error(error)
+
+
+def _register_form() -> None:
+    with st.form("patient_register", border=False):
+        name = st.text_input("Full name", placeholder="e.g. Asha Rao")
+        username = st.text_input(
+            "Choose a username", autocomplete="username",
+            help="3–64 characters: letters, digits, '.', '-' or '_'.",
+        )
+        password = st.text_input(
+            "Choose a password", type="password", autocomplete="new-password",
+            help=f"At least {auth.MIN_PASSWORD_LENGTH} characters.",
+        )
+        confirm = st.text_input("Confirm password", type="password", autocomplete="new-password")
+        consent = st.checkbox(
+            "I understand CardioRisk gives a statistical estimate, not a medical diagnosis."
+        )
+        submitted = st.form_submit_button("Create account", type="primary", width="stretch")
+    if not submitted:
+        return
+    if not name.strip() or not username.strip():
+        st.error("Enter your full name and a username.")
+    elif len(password) < auth.MIN_PASSWORD_LENGTH:
+        st.error(f"Password must be at least {auth.MIN_PASSWORD_LENGTH} characters.")
+    elif password != confirm:
+        st.error("The two passwords do not match.")
+    elif not consent:
+        st.error("Please confirm you understand this is not a diagnosis.")
+    else:
+        with st.spinner("Creating your account…"):
+            account, error = _register(username, password, name)
+        if account:
+            st.session_state["account"] = account
+            st.session_state["welcome"] = True
+            st.rerun()
+        st.error(error)
+
+
+def _render_login() -> None:
+    _, middle, _ = st.columns([1, 1.6, 1])
+    with middle:
+        st.markdown(
+            '<div class="login-hero"><div class="icon">&#10084;</div>'
+            "<h2>Welcome to CardioRisk</h2>"
+            "<p>Sign in to assess heart-disease risk and follow your results over time.</p>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        if st.session_state.pop("session_expired", False):
+            st.warning("Your session has expired. Please sign in again.")
+        if st.session_state.pop("signed_out", False):
+            st.success("You have been signed out.")
+        with st.container(border=True, key="card_login"):
+            patient_tab, admin_tab = st.tabs(["Patient", "Admin"])
+            with patient_tab:
+                sign_in_tab, register_tab = st.tabs(["Sign in", "Create account"])
+                with sign_in_tab:
+                    st.caption("See your saved assessments and track your risk over time.")
+                    _sign_in_form("patient")
+                with register_tab:
+                    st.caption("New here? Create your patient account in a minute.")
+                    _register_form()
+            with admin_tab:
+                st.caption(
+                    "For clinic staff. Admins can view every patient's records. Accounts are "
+                    "issued by the system owner."
+                )
+                _sign_in_form("admin")
+        st.caption(
+            "&#128274; Passwords are stored only as salted hashes. Sessions end after "
+            f"{auth.SESSION_HOURS} hours or when you sign out."
+        )
+
+
 st.set_page_config(page_title="CardioRisk · Heart Health", page_icon="❤️", layout="wide")
 st.markdown(CSS, unsafe_allow_html=True)
 
@@ -313,6 +562,8 @@ except (FileNotFoundError, ValueError) as error:
     st.stop()
 
 metrics = bundle.get("metrics", {})
+account = st.session_state.get("account")
+is_admin = bool(account) and account["role"] == "admin"
 api_online = _api_online()
 pills = [
     ("ok", "API online") if api_online else ("warn", "API offline · scoring locally"),
@@ -323,6 +574,12 @@ pills = [
     ),
     ("ok", f"Model v{metrics.get('model_version', '?')}"),
 ]
+if is_admin:
+    # Admins only need to hear about problems, not the service details.
+    pills = [pill for pill in pills if pill[0] == "warn"]
+if account:
+    who = account["username"] if is_admin else (account.get("name") or account["username"])
+    pills.append(("ok", f"{'Admin' if is_admin else 'Patient'} · {who}"))
 st.markdown(
     f"""
     <div class="app-header">
@@ -340,33 +597,58 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if not account:
+    _render_login()
+    st.stop()
+
 with st.sidebar:
-    st.markdown("### Model")
-    left, right = st.columns(2)
-    left.metric("ROC-AUC", f"{metrics['roc_auc']:.2f}" if "roc_auc" in metrics else "n/a")
-    right.metric("Accuracy", _pct(metrics.get("accuracy")))
-    left.metric("Recall", _pct(metrics.get("recall")))
-    right.metric("Precision", _pct(metrics.get("precision")))
-    st.caption(
-        f"Version {metrics.get('model_version', 'n/a')} · "
-        f"{metrics.get('dataset_rows', 'n/a')} training patients · "
-        f"CV accuracy {_pct(metrics.get('cv_accuracy'))} ± {_pct(metrics.get('cv_accuracy_std'))}"
-    )
-    st.caption(f"Data hash `{metrics.get('data_hash', 'n/a')}`")
+    st.markdown("### Admin" if is_admin else "### My account")
+    if is_admin:
+        st.caption(f"Signed in as **{account['username']}**. All patient records are visible.")
+    else:
+        st.caption(
+            f"Signed in as **{account.get('name') or account['username']}** "
+            f"(`{account['username']}`)  \nPatient ID `{account['patient_id']}`"
+        )
+    if st.button("Sign out", width="stretch"):
+        _sign_out()
+        st.session_state["signed_out"] = True
+        st.rerun()
     st.divider()
-    st.markdown("### About")
-    st.caption(
-        "Logistic-regression model trained on the UCI Cleveland heart-disease study. It "
-        "estimates the probability of angiographic coronary artery disease from 13 routine "
-        "clinical measurements."
-    )
+    if not is_admin:
+        st.markdown("### Model")
+        left, right = st.columns(2)
+        left.metric("ROC-AUC", f"{metrics['roc_auc']:.2f}" if "roc_auc" in metrics else "n/a")
+        right.metric("Accuracy", _pct(metrics.get("accuracy")))
+        left.metric("Recall", _pct(metrics.get("recall")))
+        right.metric("Precision", _pct(metrics.get("precision")))
+        st.caption(
+            f"Version {metrics.get('model_version', 'n/a')} · "
+            f"{metrics.get('dataset_rows', 'n/a')} training patients · CV accuracy "
+            f"{_pct(metrics.get('cv_accuracy'))} ± {_pct(metrics.get('cv_accuracy_std'))}"
+        )
+        st.caption(f"Data hash `{metrics.get('data_hash', 'n/a')}`")
+        st.divider()
+        st.markdown("### About")
+        st.caption(
+            "Logistic-regression model trained on the UCI Cleveland heart-disease study. It "
+            "estimates the probability of angiographic coronary artery disease from 13 "
+            "routine clinical measurements."
+        )
     st.warning(
         "Decision support only — not a diagnosis. Always confirm with a qualified clinician."
     )
 
-tab_single, tab_history, tab_batch, tab_xray = st.tabs(
-    ["New assessment", "Patient history", "Batch scoring", "Chest X-ray"]
-)
+if st.session_state.pop("welcome", False):
+    st.success(
+        f"Welcome, {account.get('name') or account['username']}! Your patient ID is "
+        f"**{account['patient_id']}**. Assessments you run are saved to your record."
+    )
+
+if is_admin:
+    tab_single, tab_records = st.tabs(["New assessment", "Patient records"])
+else:
+    tab_single, tab_mine = st.tabs(["New assessment", "My history"])
 
 with tab_single:
     form_column, result_column = st.columns([3, 2], gap="large")
@@ -374,13 +656,25 @@ with tab_single:
         with st.form("assessment", border=False):
             values: dict[str, float] = {}
             with st.container(border=True, key="card_patient"):
-                _section("Patient", "Optional — link this assessment to a patient record.")
-                left, right = st.columns(2)
-                patient_id = left.text_input("Patient ID", placeholder="e.g. P-1001")
-                patient_name = right.text_input("Full name", placeholder="e.g. Asha Rao")
-                patient_note = st.text_input(
-                    "Clinical notes", placeholder="e.g. referred for chest discomfort on exertion"
-                )
+                if is_admin:
+                    _section("Patient", "Optional — link this assessment to a patient record.")
+                    left, right = st.columns(2)
+                    patient_id = left.text_input("Patient ID", placeholder="e.g. P-1001")
+                    patient_name = right.text_input("Full name", placeholder="e.g. Asha Rao")
+                    patient_note = st.text_input(
+                        "Clinical notes",
+                        placeholder="e.g. referred for chest discomfort on exertion",
+                    )
+                else:
+                    _section(
+                        "Patient",
+                        "This assessment will be saved to your own record.",
+                    )
+                    st.markdown(
+                        f"**{html.escape(account.get('name') or account['username'])}** · "
+                        f"Patient ID `{account['patient_id']}`"
+                    )
+                    patient_id = patient_name = patient_note = ""
 
             with st.container(border=True, key="card_vitals"):
                 _section("Symptoms & vitals", "Demographics, presenting symptoms and bloods.")
@@ -438,14 +732,17 @@ with tab_single:
             submitted = st.form_submit_button("Calculate risk", type="primary", width="stretch")
 
     if submitted:
-        identity = {
-            "patient_id": patient_id.strip() or None,
-            "name": patient_name.strip() or None,
-            "notes": patient_note.strip() or None,
-        }
+        if is_admin:
+            identity = {
+                "patient_id": patient_id.strip() or None,
+                "name": patient_name.strip() or None,
+                "notes": patient_note.strip() or None,
+            }
+        else:
+            identity = {"patient_id": account["patient_id"], "name": None, "notes": None}
         ordered = {feature: values[feature] for feature in FEATURES}
         with st.spinner("Scoring and saving…"):
-            outcome = _assess(ordered, identity, metrics)
+            outcome = _assess(ordered, identity, metrics, account["token"])
         if outcome is not None:
             st.session_state["latest_assessment"] = outcome
             if outcome["patient_id"]:
@@ -465,175 +762,87 @@ with tab_single:
                     unsafe_allow_html=True,
                 )
 
-with tab_history:
-    last_patient = st.session_state.get("last_patient_id", "")
-    search_column, _ = st.columns([2, 3])
-    typed = search_column.text_input(
-        "Find a patient", placeholder=last_patient or "Patient ID, e.g. P-1001",
-        key="history_lookup",
-    ).strip()
-    lookup_id = typed or last_patient
-    if lookup_id:
-        record, note, was_offline = _load_history(lookup_id)
-        if record and record["history"]:
-            patient = record["patient"]
-            history = pd.DataFrame(record["history"])
-            history["created_at"] = _local_times(history["created_at"])
-            history = history.sort_values("created_at", ascending=False)
-            latest = float(history["risk_probability"].iloc[0])
-            previous = (
-                float(history["risk_probability"].iloc[1]) if len(history) > 1 else None
-            )
-
-            with st.container(border=True, key="card_patient_summary"):
-                st.markdown(f"#### {html.escape(patient.get('name') or patient['patient_id'])}")
-                caption = f"Patient ID `{patient['patient_id']}`"
-                if patient.get("notes"):
-                    caption += f" · {patient['notes']}"
-                st.caption(caption)
-                first, second, third = st.columns(3)
-                first.metric("Assessments", record["count"])
-                second.metric(
-                    "Latest risk",
-                    f"{latest:.0%}",
-                    delta=f"{(latest - previous) * 100:+.0f} pts" if previous is not None else None,
-                    delta_color="inverse",
-                )
-                third.metric("First assessed", history["created_at"].min().strftime("%d %b %Y"))
-            if note:
-                st.caption(note)
-
-            if len(history) > 1:
-                trend = history.set_index("created_at")[["risk_probability"]] * 100
-                st.line_chart(
-                    trend.rename(columns={"risk_probability": "Risk (%)"}),
-                    y_label="Risk (%)", height=220,
-                )
-            st.dataframe(
-                history[
-                    ["created_at", "risk_probability", "risk_label", "trestbps", "chol",
-                     "thalach", "model_version"]
-                ],
-                hide_index=True,
-                width="stretch",
-                column_config={
-                    "created_at": st.column_config.DatetimeColumn(
-                        "Assessed", format="D MMM YYYY, HH:mm"
-                    ),
-                    "risk_probability": st.column_config.ProgressColumn(
-                        "Risk", min_value=0.0, max_value=1.0, format="percent"
-                    ),
-                    "risk_label": "Result",
-                    "trestbps": st.column_config.NumberColumn("BP (mm Hg)", format="%d"),
-                    "chol": st.column_config.NumberColumn("Cholesterol", format="%d"),
-                    "thalach": st.column_config.NumberColumn("Peak HR", format="%d"),
-                    "model_version": "Model",
-                },
-            )
-        elif record:
-            st.info("This patient exists but has no saved assessments yet.")
-        elif "404" in note or "No saved history" in note:
-            st.info(f"No patient found with ID {lookup_id!r}. Run an assessment first.")
+if not is_admin:
+    with tab_mine:
+        record, note, expired = _signed_in_read(
+            "/me/history",
+            lambda: database.get_patient_with_history(account["patient_id"]),
+            account["token"],
+            "patient",
+        )
+        if expired:
+            _expire_session()
+        if record:
+            _render_record(record, note, own=True)
         else:
-            st.info(f"Could not load history for {lookup_id!r}: {note}")
-    else:
-        st.caption("Search by Patient ID, or run an assessment with an ID or name first.")
+            st.info(f"Could not load your history: {note}")
 
-    with st.expander("All patients"):
-        patients_data, patients_error, patients_offline = _call_api("GET", "/patients")
-        if patients_data is None and patients_offline:
-            try:
-                rows = database.list_patients()
-            except (database.DatabaseError, ValueError):
-                rows = None
-            if rows is not None:
-                patients_data = {"patients": rows, "count": len(rows)}
-                st.caption(f"{patients_error} — read directly from Supabase.")
-        if patients_data is not None and patients_data["patients"]:
-            directory = pd.DataFrame(patients_data["patients"])
-            for column in ("created_at", "last_prediction_at"):
-                directory[column] = _local_times(directory[column])
-            st.dataframe(
-                directory[
-                    ["patient_id", "name", "prediction_count", "last_prediction_at", "notes"]
-                ],
-                hide_index=True,
-                width="stretch",
-                column_config={
-                    "patient_id": "Patient ID",
-                    "name": "Name",
-                    "prediction_count": st.column_config.NumberColumn("Assessments"),
-                    "last_prediction_at": st.column_config.DatetimeColumn(
-                        "Last assessed", format="D MMM YYYY, HH:mm"
-                    ),
-                    "notes": "Notes",
-                },
+else:
+    token = account["token"]
+    with tab_records:
+        last_patient = st.session_state.get("last_patient_id", "")
+        search_column, _ = st.columns([2, 3])
+        typed = search_column.text_input(
+            "Find a patient", placeholder=last_patient or "Patient ID, e.g. P-1001",
+            key="history_lookup",
+        ).strip()
+        lookup_id = typed or last_patient
+        if lookup_id:
+            record, note, expired = _signed_in_read(
+                f"/patients/{quote(lookup_id, safe='')}/history",
+                lambda: database.get_patient_with_history(lookup_id),
+                token,
+                "admin",
             )
-        elif patients_data is not None:
-            st.info("No patients stored yet.")
+            if expired:
+                _expire_session()
+            if record:
+                _render_record(record, note, own=False)
+            elif "404" in note:
+                st.info(f"No patient found with ID {lookup_id!r}.")
+            else:
+                st.info(f"Could not load history for {lookup_id!r}: {note}")
         else:
-            st.info(f"Could not list patients: {patients_error}")
+            st.caption("Search by Patient ID to open a patient's record.")
 
-with tab_batch:
-    st.markdown("#### Batch scoring")
-    st.caption(
-        "Score many patients at once from a CSV containing the 13 model columns. "
-        "Batch results are not saved to patient records."
-    )
-    template = pd.DataFrame([FEATURE_DEFAULTS])[FEATURES]
-    st.download_button(
-        "Download CSV template",
-        template.to_csv(index=False),
-        file_name="cardiorisk_batch_template.csv",
-        mime="text/csv",
-    )
-    uploaded = st.file_uploader("Upload CSV", type="csv")
-    if uploaded:
-        try:
-            batch = pd.read_csv(uploaded)
-            results = predict(bundle, batch)
-            combined = pd.concat(
-                [batch.reset_index(drop=True), results.reset_index(drop=True)], axis=1
+        with st.expander("All patients", expanded=not lookup_id):
+            patients_data, patients_note, expired = _signed_in_read(
+                "/patients",
+                lambda: {"patients": database.list_patients()},
+                token,
+                "admin",
             )
-            risk = combined["risk_probability"]
-            first, second, third = st.columns(3)
-            first.metric("Patients scored", len(combined))
-            second.metric("High risk (≥ 50%)", int((risk >= 0.5).sum()))
-            third.metric("Average risk", f"{risk.mean():.0%}")
-            st.dataframe(
-                combined,
-                hide_index=True,
-                width="stretch",
-                column_config={
-                    "risk_probability": st.column_config.ProgressColumn(
-                        "Risk", min_value=0.0, max_value=1.0, format="percent"
-                    ),
-                    "risk_label": "Result",
-                    "prediction": "Prediction",
-                },
-            )
-            st.download_button(
-                "Download results",
-                combined.to_csv(index=False),
-                file_name="cardiorisk_predictions.csv",
-                mime="text/csv",
-                type="primary",
-            )
-        except (ValueError, pd.errors.ParserError) as error:
-            st.error(f"Could not score this file: {error}")
-
-with tab_xray:
-    st.markdown("#### Chest X-ray analysis")
-    st.info(
-        "Not available yet. A chest X-ray is an image modality and needs a separately "
-        "trained, clinically validated model (for example on NIH ChestX-ray14 or CheXpert). "
-        "An image classifier would never replace review by a radiologist or cardiologist."
-    )
-    st.file_uploader(
-        "X-ray image (reserved for a future model)",
-        type=["png", "jpg", "jpeg"],
-        disabled=True,
-    )
+            if expired:
+                _expire_session()
+            if patients_note and patients_data is not None:
+                st.caption(patients_note)
+            if patients_data is not None and patients_data["patients"]:
+                directory = pd.DataFrame(patients_data["patients"])
+                directory["last_prediction_at"] = _local_times(directory["last_prediction_at"])
+                directory["name"] = directory["name"].fillna("")
+                st.dataframe(
+                    directory[
+                        ["patient_id", "name", "prediction_count", "latest_risk",
+                         "last_prediction_at"]
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "patient_id": "Patient ID",
+                        "name": "Name",
+                        "prediction_count": st.column_config.NumberColumn("Assessments"),
+                        "latest_risk": st.column_config.ProgressColumn(
+                            "Latest risk", min_value=0.0, max_value=1.0, format="percent"
+                        ),
+                        "last_prediction_at": st.column_config.DatetimeColumn(
+                            "Last assessed", format="D MMM YYYY, HH:mm"
+                        ),
+                    },
+                )
+            elif patients_data is not None:
+                st.info("No patients stored yet.")
+            else:
+                st.info(f"Could not list patients: {patients_note}")
 
 st.markdown(
     '<div class="footer">CardioRisk is an educational MLOps project. Estimates come from a '

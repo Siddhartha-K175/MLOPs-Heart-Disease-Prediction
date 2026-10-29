@@ -64,6 +64,48 @@ CREATE TABLE IF NOT EXISTS predictions (
 CREATE INDEX IF NOT EXISTS idx_predictions_patient_id ON predictions (patient_id);
 CREATE INDEX IF NOT EXISTS idx_predictions_created_at ON predictions (created_at);
 
+-- Sign-in accounts. Admins read every patient record; a patient account is
+-- tied to exactly one patients row and sees only that history. Passwords are
+-- stored only as scrypt hashes (see src/auth.py). Admins are created with
+--     uv run python -m src.auth create-admin <username>
+-- and patients register themselves on the website's login page.
+CREATE TABLE IF NOT EXISTS accounts (
+    username      VARCHAR(64)  PRIMARY KEY,
+    password_hash VARCHAR(255) NOT NULL,
+    role          VARCHAR(16)  NOT NULL CHECK (role IN ('admin', 'patient')),
+    patient_id    VARCHAR(64)  NULL UNIQUE
+        REFERENCES patients (patient_id) ON DELETE CASCADE,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    last_login_at TIMESTAMPTZ  NULL,
+    CONSTRAINT chk_accounts_patient_link CHECK ((role = 'patient') = (patient_id IS NOT NULL))
+);
+
+-- Signed-in sessions. Only a SHA-256 of each bearer token is stored, so a
+-- database leak does not hand out live tokens.
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash CHAR(64)    PRIMARY KEY,
+    username   VARCHAR(64) NOT NULL REFERENCES accounts (username) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions (expires_at);
+
+-- One-time migration from the earlier admin-only tables: keep every admin and
+-- its password hash; old sessions are dropped, so admins sign in again.
+DO $$
+BEGIN
+    IF to_regclass('admins') IS NOT NULL THEN
+        INSERT INTO accounts (username, password_hash, role, created_at, last_login_at)
+        SELECT lower(username), password_hash, 'admin', created_at, last_login_at
+        FROM admins
+        ON CONFLICT (username) DO NOTHING;
+        DROP TABLE IF EXISTS admin_sessions;
+        DROP TABLE admins;
+    END IF;
+END;
+$$;
+
 -- Full patient history: every linked prediction with its patient identity,
 -- newest first.
 CREATE OR REPLACE VIEW patient_history AS

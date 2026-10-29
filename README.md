@@ -8,7 +8,8 @@ This project is an educational end-to-end MVP:
 - Training logs parameters, metrics, and the model to MLflow, registers it as
   `heart-disease-classifier`, and moves the `champion` alias to the new version.
 - `src/drift.py` compares new batches against the stored training distribution with PSI.
-- `app.py` serves a Streamlit website with single-patient prediction and CSV batch scoring.
+- `app.py` serves a Streamlit website with patient/admin sign-in, single-patient assessment
+  and patient history (CSV batch scoring is available through the API).
 - `api.py` serves the same model over FastAPI with input range checks and batch limits.
 - `artifacts/metrics.json` records the run (accuracy, ROC-AUC, precision/recall/F1, confusion
   matrix, data profile), `artifacts/feature_importance.csv` holds the model coefficients,
@@ -109,14 +110,51 @@ Open `http://127.0.0.1:8000/docs` for the interactive Swagger UI.
 | `POST /predict` | Score one patient (fields have defaults and enforced ranges), **store the record**, return `record_id` + `patient_id` |
 | `POST /predict-batch` | Score up to 1000 patient records (stateless, not stored) |
 | `POST /predict-csv` | Upload a CSV, get a CSV back with `prediction`, `risk_probability`, `risk_label` (stateless) |
-| `GET /patients` | Every stored patient with prediction counts and latest score time |
-| `GET /patients/{patient_id}` | Profile row for one patient (`404` if unknown) |
-| `GET /patients/{patient_id}/history` | Full prediction history for one patient, newest first |
-| `GET /predictions?limit=` | Most recent predictions across all patients (1-200 rows) |
+| `POST /auth/register` | Patient self-sign-up (`username`, `password`, `name`): creates a new patient record and returns a token |
+| `POST /auth/login` | Exchange `username` + `password` (admin or patient) for a bearer token (8-hour session) |
+| `POST /auth/logout`, `GET /auth/me` | End the session / show the account's `role` and `patient_id` |
+| `GET /me/history` 👤 | A signed-in patient's own record and history |
+| `GET /patients` 🔒 | Every stored patient with prediction counts and latest score time |
+| `GET /patients/{patient_id}` 🔒 | Profile row for one patient (`404` if unknown) |
+| `GET /patients/{patient_id}/history` 🔒 | Full prediction history for one patient, newest first |
+| `GET /predictions?limit=` 🔒 | Most recent predictions across all patients (1-200 rows) |
 
 Invalid or out-of-range inputs return `422` instead of a prediction. Responses carry the
 `model_version` that produced them. `POST /predict` also accepts three optional identity
 fields - `patient_id`, `name`, `notes` - that link the record to a patient history row.
+
+🔒 routes are **admin only** (`401` without a token, `403` for a patient token); 👤 needs a
+patient token. Send `Authorization: Bearer <access_token>` from `/auth/login` or
+`/auth/register`. `POST /predict` stays open for anonymous scoring; with a patient token the
+record is always saved to that patient's own ID, whatever identity the body contains.
+
+### Accounts: admins and patients
+
+The website opens on a login page with **Patient** and **Admin** tabs.
+
+- **Patients** create their own account (full name, username, password). Sign-up always
+  creates a *new* patient record, so nobody can claim an existing Patient ID and read its
+  history. Signed-in patients see **New assessment** (saved to their record) and **My history**.
+- **Admins** are created by the system owner and see **New assessment** and **Patient
+  records** for everyone, kept to the essentials: the patient list shows ID, name, number of
+  assessments, latest risk and last assessed date; a patient's record shows each assessment's
+  date, risk, result, BP, cholesterol and peak heart rate. Model metrics and service status
+  are hidden from admins (status badges appear only when something is wrong). Batch CSV
+  scoring is available through `POST /predict-csv`.
+
+```powershell
+uv run python -m src.auth create-admin admin                               # prompts for password
+uv run python -m src.auth create-patient-login ravi --patient-id P-1001   # login for an existing record
+uv run python -m src.auth list-accounts
+uv run python -m src.auth delete-account ravi                             # medical record is kept
+```
+
+Usernames are case-insensitive (3-64 letters, digits, `.`, `-`, `_`); passwords need at
+least 10 characters. Passwords are stored as salted scrypt hashes in `accounts`; each sign-in
+creates a random bearer token whose SHA-256 is kept in `sessions` and expires after 8 hours.
+Re-running `create-admin` resets that admin's password and signs it out everywhere. Databases
+created before patient logins existed have their `admins` table migrated into `accounts`
+automatically at startup (password hashes kept).
 
 ## Database (patients & history)
 
@@ -175,8 +213,9 @@ uv run python db.py "UPDATE patients SET notes = 'reviewed' WHERE patient_id = '
 uv run python db.py --schema heart_health_test "SELECT COUNT(*) FROM predictions;"
 ```
 
-The Streamlit **Single patient** tab sends identity + measurements to `POST /predict`, and
-the **Patient history** tab renders `GET /patients/{id}/history`. If the API is not
+The Streamlit **New assessment** tab sends measurements (and, for admins, identity) to
+`POST /predict` with the user's token. Patients' **My history** renders `GET /me/history`;
+the admin **Patient records** tab renders `GET /patients/{id}/history` and `GET /patients`. If the API is not
 running, the UI falls back to scoring locally and writing the same Supabase tables directly.
 
 ## EDA
@@ -253,7 +292,7 @@ docker compose up --build
 
 X-ray prediction is intentionally not wired to the tabular model. It needs a separately labeled
 image dataset, a CNN/transfer-learning training pipeline, image preprocessing, dataset/license
-review, and clinical validation. The UI marks this boundary rather than presenting an
-unvalidated medical image classifier as reliable.
+review, and clinical validation, so the website deliberately offers no X-ray upload rather
+than presenting an unvalidated medical image classifier as reliable.
 
 This demo is not medical advice and must not be used for diagnosis or treatment decisions.
