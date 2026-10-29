@@ -27,6 +27,16 @@ def test_load_data_binarizes_target_and_drops_missing(tmp_path, heart_frame):
     assert set(result["target"].unique()) == {0, 1}
 
 
+def test_load_data_drops_duplicate_rows(tmp_path, heart_frame):
+    frame = pd.concat([heart_frame, heart_frame.head(3)], ignore_index=True)
+    path = tmp_path / "dupes.csv"
+    frame.to_csv(path, index=False)
+
+    result = load_data(path)
+
+    assert len(result) == len(heart_frame)
+
+
 def test_load_data_rejects_out_of_range_values(tmp_path, heart_frame):
     frame = heart_frame.copy()
     frame.loc[frame.index[0], "age"] = 250
@@ -59,10 +69,18 @@ def test_train_without_mlflow_writes_artifacts(tmp_path, heart_frame):
 
     assert (artifact_dir / "heart_model.joblib").exists()
     assert (artifact_dir / "reference.json").exists()
+    assert (artifact_dir / "feature_importance.csv").exists()
     saved = json.loads((artifact_dir / "metrics.json").read_text(encoding="utf-8"))
     assert saved["holdout"] == "random_split"
     assert saved["data_hash"] == metrics["data_hash"]
     assert 0 <= saved["accuracy"] <= 1
+    assert 0 <= saved["precision"] <= 1
+    assert 0 <= saved["recall"] <= 1
+    assert 0 <= saved["f1"] <= 1
+    assert saved["smote"] is False
+    assert saved["profile"]["rows"] == len(heart_frame)
+    assert saved["profile"]["missing_cells"] == 0
+    assert saved["profile"]["duplicate_rows"] == 0
     assert "mlflow_run_id" not in saved
 
 
@@ -83,10 +101,57 @@ def test_train_with_splits_uses_cv_and_holdout(tmp_path, heart_frame):
     assert metrics["train_rows"] == len(train_frame)
     assert metrics["validation_rows"] == len(validation)
 
+    assert 0 <= metrics["precision"] <= 1
+    assert 0 <= metrics["recall"] <= 1
+    assert 0 <= metrics["f1"] <= 1
+    (true_negatives, false_positives), (false_negatives, true_positives) = (
+        metrics["confusion_matrix"]
+    )
+    assert true_negatives + false_positives + false_negatives + true_positives == len(test)
+    assert metrics["true_positives"] == true_positives
+
     bundle = load_bundle(artifact_dir / "heart_model.joblib")
     scored = predict(bundle, test[FEATURES])
     assert len(scored) == len(test)
     assert scored["prediction"].isin([0, 1]).all()
+
+
+def test_train_writes_feature_importance(tmp_path, heart_frame):
+    artifact_dir = tmp_path / "artifacts"
+    train_frame = heart_frame.iloc[::2].reset_index(drop=True)
+    test = heart_frame.iloc[1::2].reset_index(drop=True)
+
+    metrics = train(train_frame, artifact_dir, test=test, log_to_mlflow=False)
+
+    table = pd.read_csv(artifact_dir / "feature_importance.csv")
+    assert {"feature", "coefficient", "abs_coefficient", "odds_ratio"} <= set(table.columns)
+    assert table["abs_coefficient"].is_monotonic_decreasing
+    assert "age" in table["feature"].values
+    assert metrics["top_feature"] == table.loc[0, "feature"]
+
+
+def test_train_with_smote_resamples_and_reports(tmp_path, heart_frame):
+    artifact_dir = tmp_path / "artifacts"
+    train_frame = heart_frame.iloc[::3].reset_index(drop=True)
+    validation = heart_frame.iloc[1::3].reset_index(drop=True)
+    test = heart_frame.iloc[2::3].reset_index(drop=True)
+
+    metrics = train(
+        train_frame,
+        artifact_dir,
+        validation=validation,
+        test=test,
+        smote=True,
+        log_to_mlflow=False,
+    )
+
+    assert metrics["smote"] is True
+    assert 0 <= metrics["accuracy"] <= 1
+    bundle = load_bundle(artifact_dir / "heart_model.joblib")
+    scored = predict(bundle, test[FEATURES])
+    assert scored["prediction"].isin([0, 1]).all()
+    saved = json.loads((artifact_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert saved["smote"] is True
 
 
 def test_resolve_inputs_rejects_mixed_sources(tmp_path, heart_frame):

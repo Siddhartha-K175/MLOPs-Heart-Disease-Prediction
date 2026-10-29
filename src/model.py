@@ -27,17 +27,42 @@ FEATURES = [
 FEATURE_LABELS = {
     "age": "Age",
     "sex": "Sex (1 = male, 0 = female)",
-    "cp": "Chest-pain type (0-3)",
+    "cp": "Chest-pain type (1 = typical, 2 = atypical, 3 = non-anginal, 4 = asymptomatic)",
     "trestbps": "Resting blood pressure (mm Hg)",
     "chol": "Serum cholesterol (mg/dl)",
     "fbs": "Fasting blood sugar > 120 mg/dl (1 = true)",
-    "restecg": "Resting ECG (0-2)",
+    "restecg": "Resting ECG (0 = normal, 1 = ST-T abnormality, 2 = LV hypertrophy)",
     "thalach": "Maximum heart rate",
     "exang": "Exercise-induced angina (1 = yes)",
     "oldpeak": "ST depression",
-    "slope": "ST slope (0-2)",
+    "slope": "ST slope (1 = upsloping, 2 = flat, 3 = downsloping)",
     "ca": "Major vessels (0-3)",
-    "thal": "Thalassemia (0-3)",
+    "thal": "Thalassemia (3 = normal, 6 = fixed defect, 7 = reversible defect)",
+}
+
+# Category codes exactly as they appear in the UCI Cleveland training data. The
+# encoder ignores unseen categories, so the UI must only offer these values.
+FEATURE_CHOICES: dict[str, dict[int, str]] = {
+    "sex": {1: "Male", 0: "Female"},
+    "cp": {
+        1: "Typical angina",
+        2: "Atypical angina",
+        3: "Non-anginal pain",
+        4: "Asymptomatic",
+    },
+    "fbs": {0: "≤ 120", 1: "> 120"},
+    "restecg": {0: "Normal", 1: "ST-T wave abnormality", 2: "Left ventricular hypertrophy"},
+    "exang": {0: "No", 1: "Yes"},
+    "slope": {1: "Upsloping", 2: "Flat", 3: "Downsloping"},
+    "ca": {0: "0 vessels", 1: "1 vessel", 2: "2 vessels", 3: "3 vessels"},
+    "thal": {3: "Normal", 6: "Fixed defect", 7: "Reversible defect"},
+}
+
+# A typical middle-aged patient; every categorical value is a code the model knows.
+FEATURE_DEFAULTS: dict[str, float] = {
+    "age": 55, "sex": 1, "cp": 3, "trestbps": 130, "chol": 240,
+    "fbs": 0, "restecg": 0, "thalach": 150, "exang": 0, "oldpeak": 1.0,
+    "slope": 2, "ca": 0, "thal": 3,
 }
 
 # Clinically plausible ranges; rows outside them are rejected rather than scored.

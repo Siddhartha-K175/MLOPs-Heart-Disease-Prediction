@@ -2,6 +2,18 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src import database
+
+
+@pytest.fixture
+def db_schema(monkeypatch):
+    """Point every database helper at a clean, throwaway Postgres schema."""
+    if not database.DB_URL:
+        pytest.skip("SUPABASE_DB_URL is not set")
+    monkeypatch.setattr(database, "DB_SCHEMA", database.TEST_SCHEMA)
+    database.recreate_db(database.TEST_SCHEMA)
+    yield database.TEST_SCHEMA
+
 
 @pytest.fixture
 def heart_frame() -> pd.DataFrame:

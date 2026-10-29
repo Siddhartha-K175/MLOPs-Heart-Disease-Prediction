@@ -7,6 +7,19 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      # Plain Postgres stands in for Supabase (same engine, same SQL).
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -19,3 +32,7 @@ jobs:
         run: uv run ruff check .
       - name: Test
         run: uv run pytest -q
+        env:
+          SUPABASE_DB_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+          DB_SCHEMA: heart_health
+          DB_TEST_SCHEMA: heart_health_test

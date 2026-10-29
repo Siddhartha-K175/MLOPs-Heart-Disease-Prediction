@@ -13,23 +13,27 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, create_model
 
-from src.model import FEATURE_BOUNDS, FEATURE_LABELS, FEATURES, load_bundle, predict
+from src import database
+from src.advice import recommendations
+from src.model import (
+    FEATURE_BOUNDS,
+    FEATURE_DEFAULTS,
+    FEATURE_LABELS,
+    FEATURES,
+    load_bundle,
+    predict,
+)
 
 LOGGER = logging.getLogger("heart.api")
 ROOT = Path(__file__).parent
 ARTIFACT = ROOT / "artifacts" / "heart_model.joblib"
 MAX_BATCH_ROWS = 1000
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
-
-DEFAULTS = {
-    "age": 55.0, "sex": 1, "cp": 1, "trestbps": 130.0, "chol": 240.0,
-    "fbs": 0, "restecg": 1, "thalach": 150.0, "exang": 0, "oldpeak": 1.0,
-    "slope": 1, "ca": 0, "thal": 2,
-}
+IDENTITY_FIELDS = ("patient_id", "name", "notes")
 
 Patient = create_model(
     "Patient",
@@ -37,7 +41,7 @@ Patient = create_model(
         feature: (
             float,
             Field(
-                float(DEFAULTS[feature]),
+                float(FEATURE_DEFAULTS[feature]),
                 ge=FEATURE_BOUNDS[feature][0],
                 le=FEATURE_BOUNDS[feature][1],
                 description=FEATURE_LABELS[feature],
@@ -45,7 +49,32 @@ Patient = create_model(
         )
         for feature in FEATURES
     },
+    # Optional identity used to link the prediction to a patient history row.
+    patient_id=(
+        str | None,
+        Field(None, max_length=64, description="Client-assigned patient id (e.g. P-1001)."),
+    ),
+    name=(
+        str | None,
+        Field(
+            None,
+            max_length=120,
+            description="Patient name; an id is generated when patient_id is empty.",
+        ),
+    ),
+    notes=(
+        str | None,
+        Field(None, max_length=500, description="Free-text clinical note stored with the patient."),
+    ),
 )
+
+
+class Guidance(BaseModel):
+    tier: str
+    headline: str
+    actions: list[str]
+    emergency_note: str
+    disclaimer: str
 
 
 class Prediction(BaseModel):
@@ -53,15 +82,31 @@ class Prediction(BaseModel):
     risk_probability: float
     risk_label: str
     model_version: str | None = None
+    guidance: Guidance | None = None
+    record_id: int | None = Field(None, description="Database id of the saved prediction row.")
+    patient_id: str | None = Field(None, description="Patient id the record was linked to.")
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """Load the trained model bundle before serving traffic."""
+    """Load the trained model bundle and create the database tables."""
     try:
         application.state.bundle = load_bundle(ARTIFACT)
     except (FileNotFoundError, ValueError) as error:
         raise RuntimeError(f"{error} Run `uv run python -m src.train` first.") from error
+    try:
+        database.init_db()
+    except (database.DatabaseError, ValueError) as error:
+        raise RuntimeError(
+            f"Could not initialize Supabase Postgres at {database.server_label()} "
+            f"(schema {database.DB_SCHEMA!r}): {error}. "
+            "Check SUPABASE_DB_URL in .env."
+        ) from error
+    LOGGER.info(
+        "supabase ready: %s schema=%s",
+        database.server_label(),
+        database.DB_SCHEMA,
+    )
     yield
 
 
@@ -77,6 +122,38 @@ def _model_version() -> str | None:
     metrics = app.state.bundle.get("metrics", {})
     version = metrics.get("model_version")
     return str(version) if version is not None else None
+
+
+def _identity(patient: Patient) -> dict[str, str | None]:
+    """Trim identity fields and treat empty strings as 'not provided'."""
+    cleaned: dict[str, str | None] = {}
+    for field in IDENTITY_FIELDS:
+        value = getattr(patient, field)
+        cleaned[field] = (value.strip() or None) if isinstance(value, str) else value
+    return cleaned
+
+
+def _persist(prediction: Prediction, payload: dict, identity: dict[str, str | None]) -> None:
+    """Store the scored record; failures surface as HTTP 500, never silent data loss."""
+    try:
+        saved = database.save_prediction(
+            features={feature: payload[feature] for feature in FEATURES},
+            prediction=prediction.prediction,
+            risk_probability=prediction.risk_probability,
+            risk_label=prediction.risk_label,
+            model_version=prediction.model_version,
+            **identity,
+        )
+    except database.DatabaseError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Prediction succeeded but could not be saved to the "
+                f"{database.DB_SCHEMA!r} Supabase schema: {error}"
+            ),
+        ) from error
+    prediction.record_id = saved["record_id"]
+    prediction.patient_id = saved["patient_id"]
 
 
 def _score(frame: pd.DataFrame) -> list[Prediction]:
@@ -108,7 +185,10 @@ def home() -> dict[str, str]:
         "service": app.title,
         "version": app.version,
         "docs": "/docs",
-        "endpoints": "GET /health, POST /predict, POST /predict-batch, POST /predict-csv",
+        "endpoints": (
+            "GET /health, POST /predict, POST /predict-batch, POST /predict-csv, "
+            "GET /patients, GET /patients/{patient_id}/history, GET /predictions"
+        ),
         "disclaimer": "Not medical advice. Demo use only.",
     }
 
@@ -122,8 +202,17 @@ def health() -> dict:
 
 @app.post("/predict", response_model=Prediction, tags=["prediction"])
 def predict_single(patient: Patient) -> Prediction:
-    """Score one patient record."""
-    return _score(pd.DataFrame([patient.model_dump()]))[0]
+    """Score one patient, attach tiered guidance, and store the record in the database."""
+    payload = patient.model_dump()
+    scored = _score(pd.DataFrame([payload]))[0]
+    scored.guidance = Guidance(
+        **recommendations(float(scored.risk_probability), payload)
+    )
+    _persist(scored, payload, _identity(patient))
+    LOGGER.info(
+        "saved record_id=%s patient_id=%s", scored.record_id, scored.patient_id
+    )
+    return scored
 
 
 @app.post("/predict-batch", response_model=list[Prediction], tags=["prediction"])
@@ -153,7 +242,47 @@ def predict_csv(file: UploadFile) -> Response:
         raise HTTPException(status_code=422, detail=f"Could not parse CSV: {error}") from error
     results = _score(frame)
     output = pd.concat(
-        [frame.reset_index(drop=True), pd.DataFrame([item.model_dump() for item in results])],
+        [
+            frame.reset_index(drop=True),
+            pd.DataFrame(
+                [
+                    item.model_dump(exclude={"guidance", "record_id", "patient_id"})
+                    for item in results
+                ]
+            ),
+        ],
         axis=1,
     )
     return Response(content=output.to_csv(index=False), media_type="text/csv")
+
+
+@app.get("/patients", tags=["history"])
+def list_patients() -> dict:
+    """Every stored patient with prediction counts and latest score time."""
+    patients = database.list_patients()
+    return {"count": len(patients), "patients": patients}
+
+
+@app.get("/patients/{patient_id}", tags=["history"])
+def read_patient(patient_id: str) -> dict:
+    """Profile row for one patient id."""
+    patient = database.get_patient(patient_id)
+    if patient is None:
+        raise HTTPException(status_code=404, detail=f"No patient with id {patient_id!r}.")
+    return patient
+
+
+@app.get("/patients/{patient_id}/history", tags=["history"])
+def patient_history(patient_id: str) -> dict:
+    """Full prediction history for one patient, newest first."""
+    record = database.get_patient_with_history(patient_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No patient with id {patient_id!r}.")
+    return record
+
+
+@app.get("/predictions", tags=["history"])
+def recent_predictions(limit: int = Query(50, ge=1, le=200)) -> dict:
+    """Most recent predictions across all patients (anonymous rows included)."""
+    rows = database.recent_predictions(limit=limit)
+    return {"count": len(rows), "predictions": rows}
