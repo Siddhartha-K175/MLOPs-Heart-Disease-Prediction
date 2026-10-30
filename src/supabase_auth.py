@@ -13,16 +13,15 @@ Settings (in .env)::
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import httpx
 
-from src import database  # noqa: F401  (loads .env before the settings are read)
+from src.database import env  # importing src.database also loads .env
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-PUBLISHABLE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "")
-APP_URL = os.environ.get("APP_URL", "")
+SUPABASE_URL = env("SUPABASE_URL").rstrip("/")
+PUBLISHABLE_KEY = env("SUPABASE_PUBLISHABLE_KEY")
+APP_URL = env("APP_URL")
 
 
 class AuthError(Exception):

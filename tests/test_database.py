@@ -151,3 +151,9 @@ def test_test_date_is_backfilled_for_older_tables(db_schema):
         connection.commit()
     database.init_db()
     assert database.recent_predictions()[0]["assessed_on"] == date(2025, 6, 30)
+
+
+def test_env_settings_ignore_pasted_whitespace(monkeypatch):
+    monkeypatch.setenv("CARDIORISK_SAMPLE", "  postgres://host/db\n \n")
+    assert database.env("CARDIORISK_SAMPLE") == "postgres://host/db"
+    assert database.env("CARDIORISK_MISSING", " fallback ") == "fallback"

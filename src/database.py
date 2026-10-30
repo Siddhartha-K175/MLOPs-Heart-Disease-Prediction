@@ -56,9 +56,19 @@ def _load_env() -> None:
 
 _load_env()
 
-DB_URL = os.environ.get("SUPABASE_DB_URL", "")
-DB_SCHEMA = os.environ.get("DB_SCHEMA", "heart_health")
-TEST_SCHEMA = os.environ.get("DB_TEST_SCHEMA", "heart_health_test")
+
+def env(name: str, default: str = "") -> str:
+    """An environment setting with stray whitespace removed.
+
+    Values pasted into hosting dashboards often pick up a trailing newline, which
+    would otherwise end up inside the database name or URL.
+    """
+    return os.environ.get(name, default).strip()
+
+
+DB_URL = env("SUPABASE_DB_URL")
+DB_SCHEMA = env("DB_SCHEMA", "heart_health")
+TEST_SCHEMA = env("DB_TEST_SCHEMA", "heart_health_test")
 
 # Schema names are interpolated into DDL, so they must be plain identifiers.
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

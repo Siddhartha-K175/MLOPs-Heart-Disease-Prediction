@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import html
-import os
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -27,7 +26,7 @@ ROOT = Path(__file__).parent
 ARTIFACT = ROOT / "artifacts" / "heart_model.joblib"
 # The UI calls the API to score and store; when the API is down it falls back
 # to scoring locally and writing the same Supabase tables directly.
-API_URL = os.environ.get("HEART_API_URL", "http://127.0.0.1:8000").rstrip("/")
+API_URL = database.env("HEART_API_URL", "http://127.0.0.1:8000").rstrip("/")
 LOCAL_TZ = datetime.now().astimezone().tzinfo
 
 # tier -> (title, accent colour, tint) for the result card and scale.
