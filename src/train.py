@@ -4,6 +4,8 @@ Usage:
     python -m src.train
     python -m src.train --data data/heart.csv
     python -m src.train --train data/train.csv --validate data/validate.csv --test data/test.csv
+    python -m src.train --multisite                  # all four UCI hospitals, pooled
+    python -m src.train --multisite --core-features  # ...without ca, thal and slope
 """
 
 from __future__ import annotations
@@ -51,6 +53,8 @@ DEFAULT_URL = "https://archive.ics.uci.edu/static/public/45/heart+disease.zip"
 TARGET = "target"
 CATEGORICAL_FEATURES = ["sex", "cp", "fbs", "restecg", "exang", "slope", "ca", "thal"]
 NUMERIC_FEATURES = [feature for feature in FEATURES if feature not in CATEGORICAL_FEATURES]
+# Mostly unmeasured outside Cleveland; see src/multisite.py.
+CORE_FEATURES = [feature for feature in FEATURES if feature not in ("ca", "thal", "slope")]
 CV_FOLDS = 5
 SPLIT_NAMES = ("train", "validate", "test")
 DEFAULT_SPLITS = {name: Path("data") / f"{name}.csv" for name in SPLIT_NAMES}
@@ -117,12 +121,19 @@ def data_hash(*frames: pd.DataFrame) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-def build_pipeline(*, smote: bool = False) -> Pipeline | ImbPipeline:
+def build_pipeline(
+    *, smote: bool = False, features: list[str] | None = None
+) -> Pipeline | ImbPipeline:
     """Build a preprocessing and logistic-regression pipeline.
 
     With `smote=True`, an SMOTE step runs after scaling so each cross-validation
     fold resamples only its own training portion (no leakage into validation rows).
+    `features` restricts the model to a subset of FEATURES (other columns are
+    ignored); missing values in the used columns are imputed.
     """
+    used = set(features or FEATURES)
+    numeric_features = [feature for feature in NUMERIC_FEATURES if feature in used]
+    categorical_features = [feature for feature in CATEGORICAL_FEATURES if feature in used]
     numeric = Pipeline(
         steps=[("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]
     )
@@ -134,8 +145,8 @@ def build_pipeline(*, smote: bool = False) -> Pipeline | ImbPipeline:
     )
     preprocessor = ColumnTransformer(
         transformers=[
-            ("numeric", numeric, NUMERIC_FEATURES),
-            ("categorical", categorical, CATEGORICAL_FEATURES),
+            ("numeric", numeric, numeric_features),
+            ("categorical", categorical, categorical_features),
         ]
     )
     steps = [("preprocessor", preprocessor)]
@@ -190,11 +201,13 @@ def feature_importance(pipeline: Pipeline | ImbPipeline) -> pd.DataFrame:
     return table
 
 
-def _cross_validate(fit_frame: pd.DataFrame, *, smote: bool = False) -> dict[str, float]:
+def _cross_validate(
+    fit_frame: pd.DataFrame, *, smote: bool = False, features: list[str] | None = None
+) -> dict[str, float]:
     """5-fold stratified cross-validation over the model-selection data."""
     splitter = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=42)
     results = cross_validate(
-        build_pipeline(smote=smote),
+        build_pipeline(smote=smote, features=features),
         fit_frame[FEATURES],
         fit_frame[TARGET],
         cv=splitter,
@@ -228,6 +241,8 @@ def train(
     test: pd.DataFrame | None = None,
     profile: dict[str, Any] | None = None,
     smote: bool = False,
+    features: list[str] | None = None,
+    dataset: str = "cleveland",
     tracking_uri: str = "sqlite:///mlflow.db",
     experiment_name: str = "heart-disease",
     registered_model_name: str = "heart-disease-classifier",
@@ -240,7 +255,8 @@ def train(
     Without them the legacy 80/20 random split applies.
 
     `profile` holds pre-cleaning missingness/duplicate counts; `smote=True`
-    resamples each training fold with SMOTE.
+    resamples each training fold with SMOTE. `features` restricts the model to a
+    subset of FEATURES; `dataset` names the training data in the metrics.
     """
     split_frames = [data]
     if validation is not None:
@@ -249,7 +265,8 @@ def train(
         split_frames.append(test)
     metrics: dict[str, Any] = {
         "model": "logistic_regression",
-        "features": FEATURES,
+        "features": list(features or FEATURES),
+        "dataset": dataset,
         "data_hash": data_hash(*split_frames),
         "smote": bool(smote),
         "profile": summarize_profile(profile if profile is not None else data_profile(data)),
@@ -259,7 +276,7 @@ def train(
         x_train, x_test, y_train, y_test = train_test_split(
             data[FEATURES], data[TARGET], test_size=0.2, random_state=42, stratify=data[TARGET]
         )
-        pipeline = build_pipeline(smote=smote)
+        pipeline = build_pipeline(smote=smote, features=features)
         pipeline.fit(x_train, y_train)
         metrics |= {
             "dataset_rows": len(data),
@@ -278,9 +295,9 @@ def train(
             "validation_rows": len(validation) if validation is not None else 0,
             "test_rows": len(test) if test is not None else 0,
             "cv_folds": CV_FOLDS,
-            **_cross_validate(fit_frame, smote=smote),
+            **_cross_validate(fit_frame, smote=smote, features=features),
         }
-        pipeline = build_pipeline(smote=smote)
+        pipeline = build_pipeline(smote=smote, features=features)
         pipeline.fit(fit_frame[FEATURES], fit_frame[TARGET])
         holdout = test if test is not None else validation
         assert holdout is not None
@@ -313,7 +330,8 @@ def train(
                     "holdout": metrics["holdout"],
                     "top_feature": metrics["top_feature"],
                     "data_hash": metrics["data_hash"],
-                    "features": ",".join(FEATURES),
+                    "dataset": dataset,
+                    "features": ",".join(metrics["features"]),
                 }
             )
             logged = {
@@ -372,6 +390,17 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resample training folds with SMOTE to balance the classes.",
     )
+    parser.add_argument(
+        "--multisite",
+        action="store_true",
+        help="Train on all four UCI hospitals (Cleveland, Hungary, Switzerland, VA) pooled; "
+        "missing values are imputed.",
+    )
+    parser.add_argument(
+        "--core-features",
+        action="store_true",
+        help="Leave out ca, thal and slope, which most non-Cleveland patients lack.",
+    )
     return parser
 
 
@@ -394,6 +423,14 @@ def _resolve_inputs(
     Returns (train, validation, test, combined pre-cleaning profile).
     """
     explicit = [getattr(args, name) for name in SPLIT_NAMES]
+    if getattr(args, "multisite", False):
+        if args.data or any(explicit):
+            raise ValueError("--multisite cannot be combined with --data or explicit splits.")
+        from .multisite import load_sites
+
+        sites, _ = load_sites()
+        pooled = sites[FEATURES + [TARGET]]
+        return pooled, None, None, data_profile(pooled)
     if args.data and any(explicit):
         raise ValueError("--data cannot be combined with --train/--validate/--test.")
     if args.data:
@@ -427,6 +464,8 @@ def main() -> int:
             test=test_frame,
             profile=profile,
             smote=args.smote,
+            features=CORE_FEATURES if args.core_features else None,
+            dataset="uci_four_sites" if args.multisite else "cleveland",
             tracking_uri=args.mlflow_tracking_uri,
             experiment_name=args.experiment,
             registered_model_name=args.registered_model,

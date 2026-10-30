@@ -82,6 +82,42 @@ Holdout `metrics.json` (mirrored in MLflow) includes `accuracy`, `roc_auc`, `pre
 `artifacts/feature_importance.csv` (`coefficient`, `abs_coefficient`, `odds_ratio`), sorted by
 effect size, and logged to MLflow as an artifact.
 
+### Multi-hospital data and external validation
+
+The UCI collection has four hospitals; the production model uses only Cleveland.
+`src/multisite.py` loads all four (920 patients), keeps gaps as missing values for the
+pipeline's imputers (placeholder zeros and out-of-range values are blanked rather than
+rejected), and validates across hospitals:
+
+```powershell
+uv run python -m src.multisite                      # artifacts/site_validation.json + MLflow run
+uv run python -m src.train --multisite              # candidate trained on all four hospitals
+uv run python -m src.train --multisite --core-features   # ...without ca, thal, slope
+```
+
+- **Cleveland -> other hospitals**: train on Cleveland (as production does), test on each
+  other hospital. **Leave-one-site-out**: train on three hospitals, test on the fourth.
+- Both run for all 13 features and a **core** set without `ca`, `thal` and `slope`, which
+  most non-Cleveland patients never had measured (90-99% missing).
+- No missing-value indicator columns: missingness mostly reveals the hospital, and disease
+  rates differ by hospital (36-94%), so indicators would teach the model the hospital.
+
+Findings (logistic regression, ROC-AUC / recall at the 0.5 threshold):
+
+| Trained on Cleveland, tested on | 13 features | core 10 features |
+| --- | --- | --- |
+| Cleveland (internal 5-fold CV) | 0.92 / - | 0.88 / - |
+| Hungary (n=293, 36% disease) | 0.88 / 0.66 | 0.88 / 0.79 |
+| Switzerland (n=123, 94%) | 0.76 / 0.62 | 0.76 / 0.82 |
+| VA Long Beach (n=199, 74%) | 0.70 / 0.52 | 0.74 / 0.86 |
+
+The 13-feature model looks best at home but transfers worst: it leans on the fluoroscopy
+and thallium results other hospitals lack, misses about half of VA patients with disease
+and under-predicts risk there (45% predicted vs 74% observed). The core model gives up a
+little at home for far better recall and calibration elsewhere. Candidates trained on all
+four hospitals are registered separately (`heart-disease-classifier-multisite-all` /
+`-core`) and do not replace the production `champion`.
+
 ### High-risk prevention guidance
 
 When `risk_probability >= 0.5` the Streamlit app expands a prevention box, and
