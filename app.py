@@ -107,10 +107,17 @@ def _call_api(
         return None, "API returned a non-JSON response", False
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
+def _api_health() -> bool:
+    # A sleeping serverless API takes several seconds to wake, so allow for it.
+    # Failures raise and are therefore not cached: the next page load checks again.
+    httpx.get(f"{API_URL}/health", timeout=20.0).raise_for_status()
+    return True
+
+
 def _api_online() -> bool:
     try:
-        return httpx.get(f"{API_URL}/health", timeout=3.0).status_code == 200
+        return _api_health()
     except httpx.HTTPError:
         return False
 
