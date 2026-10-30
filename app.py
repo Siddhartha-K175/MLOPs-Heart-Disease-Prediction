@@ -629,8 +629,9 @@ api_online = _api_online()
 pills = [
     ("ok", "API online") if api_online else ("warn", "API offline · scoring locally"),
     (
+        # The API holds the database connection; the site needs its own only as a fallback.
         ("ok", f"Supabase · {database.DB_SCHEMA}")
-        if database.DB_URL
+        if api_online or database.DB_URL
         else ("warn", "Database not configured")
     ),
     ("ok", f"Model v{metrics.get('model_version', '?')}"),

@@ -304,10 +304,23 @@ load it; retrain and commit it again to ship a new model version.
    `SUPABASE_PUBLISHABLE_KEY` and `APP_URL` (same meaning as in `.env`).
 3. Deploy, then open `https://<project>.vercel.app/health` and `/docs`.
 
-The Streamlit website cannot run on Vercel: it needs a long-running server with WebSocket
-connections. Host it on Streamlit Community Cloud, Render or Hugging Face Spaces with
-`HEART_API_URL` set to the Vercel URL, and update `APP_URL` plus the Supabase Site URL to the
-website's address.
+## Deploy the website to Streamlit Community Cloud
+
+The Streamlit website cannot run on Vercel (it needs a long-running server with WebSocket
+connections), so it runs on Streamlit Community Cloud instead:
+
+1. On share.streamlit.io choose **Create app -> Deploy a public app from GitHub**: this
+   repository, branch `main`, main file path `website/streamlit_app.py`, Python 3.12.
+2. Under **Advanced settings -> Secrets** add `HEART_API_URL = "https://<project>.vercel.app"`.
+   That is the only setting the site needs: it scores, saves and signs users in through the
+   API, so the database password never has to be stored on the website host.
+3. Set `APP_URL` on Vercel and the Supabase Auth **Site URL** to the site's
+   `https://<app>.streamlit.app` address so confirmation emails return to it.
+
+`website/streamlit_app.py` copies root-level secrets into the environment and runs `app.py`;
+`website/requirements.txt` pins the website's packages from `uv.lock` (Community Cloud reads
+the dependency file next to the entrypoint first). Regenerate it after dependency changes:
+`uv export --frozen --extra ui --no-dev --no-emit-project --no-hashes -o website/requirements.txt`.
 
 ## Docker
 
