@@ -1,17 +1,21 @@
 """Admin and patient accounts with sign-in sessions.
 
 Admins read every patient record; a patient account is linked to one patient
-record and sees only that history. Passwords are stored as salted scrypt
-hashes; a sign-in returns a random bearer token whose SHA-256 is kept in
-``sessions`` and expires after ``SESSION_HOURS``. Usernames are case-insensitive.
+record and sees only that history.
 
-Patients register on the website. Manage accounts from a terminal (passwords
-are prompted, never echoed)::
+* Admins sign in with a username and a password stored here as a salted
+  scrypt hash.
+* Patients register and sign in with their email through Supabase Auth
+  (src/supabase_auth.py), which sends the confirmation email and keeps the
+  password. A patient's record is created on their first confirmed sign-in.
+
+Either way a sign-in returns a random bearer token whose SHA-256 is kept in
+``sessions`` and expires after ``SESSION_HOURS``. Manage admins from a terminal
+(passwords are prompted, never echoed)::
 
     uv run python -m src.auth create-admin admin
-    uv run python -m src.auth create-patient-login asha --patient-id P-1001
     uv run python -m src.auth list-accounts
-    uv run python -m src.auth delete-account asha
+    uv run python -m src.auth delete-account someone@example.com
 """
 
 from __future__ import annotations
@@ -27,16 +31,21 @@ import sys
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from src import database
+from src import database, supabase_auth
 
 SESSION_HOURS = 8
 MIN_PASSWORD_LENGTH = 10
 ROLES = ("admin", "patient")
 _USERNAME = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SCRYPT = {"n": 2**14, "r": 8, "p": 1}
 # Verified against when the username is unknown, so a miss costs the same time
 # as a wrong password and does not reveal which usernames exist.
 _DUMMY_HASH: str | None = None
+
+
+class SignInError(Exception):
+    """A sign-in that failed for a reason worth telling the user (e.g. unconfirmed email)."""
 
 
 def hash_password(password: str) -> str:
@@ -93,58 +102,84 @@ def create_admin(username: str, password: str, schema: str | None = None) -> Non
     database.save_account(username, hash_password(password), "admin", schema=schema)
 
 
-def create_patient_login(
-    username: str, password: str, patient_id: str, schema: str | None = None
-) -> None:
-    """Give an existing patient record a sign-in (used by staff, not self-service)."""
-    username = normalize_username(username)
-    _check_password(password)
-    if database.get_patient(patient_id, schema=schema) is None:
-        raise ValueError(f"No patient with id {patient_id!r}.")
-    existing = database.get_account(username, schema=schema)
-    if existing and existing["patient_id"] != patient_id:
-        raise ValueError("That username is already taken.")
-    database.save_account(
-        username, hash_password(password), "patient", patient_id=patient_id, schema=schema
-    )
+def normalize_email(email: str) -> str:
+    cleaned = email.strip().lower()
+    if len(cleaned) > 254 or not _EMAIL.match(cleaned):
+        raise ValueError("Enter a valid email address.")
+    return cleaned
 
 
-def register_patient(
-    username: str, password: str, name: str, schema: str | None = None
-) -> str:
-    """Self-service patient sign-up: creates a new patient record and its account."""
-    username = normalize_username(username)
+def register_patient(email: str, password: str, name: str) -> str:
+    """Patient email sign-up through Supabase Auth; returns the normalised email.
+
+    Supabase emails a confirmation link; the account works once it is opened.
+    """
+    email = normalize_email(email)
     _check_password(password)
     name = name.strip()
     if not name or len(name) > 120:
         raise ValueError("Enter your full name (up to 120 characters).")
-    return database.register_patient(username, hash_password(password), name, schema=schema)
+    try:
+        supabase_auth.sign_up(email, password, name)
+    except supabase_auth.AuthError as error:
+        raise ValueError(str(error)) from error
+    return email
+
+
+def _start_session(account: dict[str, Any], schema: str | None) -> dict[str, Any]:
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(UTC) + timedelta(hours=SESSION_HOURS)
+    database.create_session(_token_hash(token), account["username"], expires_at, schema=schema)
+    return {
+        "access_token": token,
+        "username": account["username"],
+        "role": account["role"],
+        "patient_id": account["patient_id"],
+        "email": account.get("email"),
+        "expires_at": expires_at,
+    }
+
+
+def _patient_login(email: str, password: str, schema: str | None) -> dict[str, Any] | None:
+    try:
+        email = normalize_email(email)
+        user = supabase_auth.sign_in(email, password)
+    except ValueError:
+        return None
+    except supabase_auth.AuthError as error:
+        if str(error) == "Incorrect email or password.":
+            return None
+        raise SignInError(str(error)) from error
+    name = (user.get("user_metadata") or {}).get("full_name")
+    try:
+        account = database.link_auth_patient(user["id"], email, name, schema=schema)
+    except ValueError as error:
+        raise SignInError(str(error)) from error
+    return _start_session(account, schema)
 
 
 def login(username: str, password: str, schema: str | None = None) -> dict[str, Any] | None:
-    """Check credentials; on success start a session and return its token and role."""
+    """Check credentials; on success start a session and return its token and role.
+
+    An email address signs a patient in through Supabase Auth; anything else is an
+    admin username checked against the local password hash. Returns ``None`` for
+    wrong credentials and raises :class:`SignInError` for other refusals.
+    """
     global _DUMMY_HASH
+    if "@" in username:
+        return _patient_login(username, password, schema)
     try:
         username = normalize_username(username)
         account = database.get_account(username, schema=schema)
     except ValueError:
         account = None
-    if account is None:
+    if account is None or not account["password_hash"]:
         _DUMMY_HASH = _DUMMY_HASH or hash_password(secrets.token_hex(8))
         verify_password(password, _DUMMY_HASH)
         return None
     if not verify_password(password, account["password_hash"]):
         return None
-    token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(UTC) + timedelta(hours=SESSION_HOURS)
-    database.create_session(_token_hash(token), username, expires_at, schema=schema)
-    return {
-        "access_token": token,
-        "username": username,
-        "role": account["role"],
-        "patient_id": account["patient_id"],
-        "expires_at": expires_at,
-    }
+    return _start_session(account, schema)
 
 
 def current_session(token: str | None, schema: str | None = None) -> dict[str, Any] | None:
@@ -171,11 +206,6 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     admin = commands.add_parser("create-admin", help="Create an admin or reset its password")
     admin.add_argument("username")
-    patient = commands.add_parser(
-        "create-patient-login", help="Give an existing patient record a sign-in"
-    )
-    patient.add_argument("username")
-    patient.add_argument("--patient-id", required=True)
     commands.add_parser("list-accounts", help="List admin and patient accounts")
     remove = commands.add_parser("delete-account", help="Delete a sign-in account")
     remove.add_argument("username")
@@ -189,12 +219,6 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             create_admin(args.username, password)
             print(f"Admin {args.username.lower()!r} saved. Existing sessions were signed out.")
-        elif args.command == "create-patient-login":
-            password = _prompt_password(args.username)
-            if password is None:
-                return 1
-            create_patient_login(args.username, password, args.patient_id)
-            print(f"Patient login {args.username.lower()!r} linked to {args.patient_id}.")
         elif args.command == "list-accounts":
             accounts = database.list_accounts()
             if not accounts:
@@ -204,8 +228,9 @@ def main(argv: list[str] | None = None) -> int:
                 last = account["last_login_at"] or "never"
                 print(f"{account['role']:<8} {account['username']}{link}  "
                       f"(created {account['created_at']:%Y-%m-%d}, last sign-in {last})")
-        elif database.delete_account(normalize_username(args.username)):
-            print(f"Account {args.username.lower()!r} deleted (medical records are kept).")
+        elif database.delete_account(args.username.strip().lower()):
+            print(f"Account {args.username.lower()!r} deleted (medical records are kept). "
+                  "Remove a patient's email login under Supabase -> Authentication -> Users.")
         else:
             print(f"No account named {args.username!r}.", file=sys.stderr)
             return 1

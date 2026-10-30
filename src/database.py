@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import re
 from contextlib import closing
+from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -65,6 +66,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Insert column names are built only from this whitelist (never from input).
 _PREDICTION_COLUMNS = (
     "patient_id", *FEATURES, "prediction", "risk_probability", "risk_label", "model_version",
+    "assessed_on",
 )
 
 
@@ -177,9 +179,12 @@ def save_prediction(
     patient_id: str | None = None,
     name: str | None = None,
     notes: str | None = None,
+    assessed_on: date | None = None,
     schema: str | None = None,
 ) -> dict[str, Any]:
     """Persist one scored prediction; returns ``record_id`` and resolved ``patient_id``.
+
+    ``assessed_on`` is the date the measurements were taken (default: today).
 
     When neither ``patient_id`` nor ``name`` is given the row is stored
     anonymously (``patient_id`` is NULL) but still kept as an audit record.
@@ -202,6 +207,7 @@ def save_prediction(
             float(risk_probability),
             risk_label,
             model_version,
+            assessed_on or date.today(),
         ]
         row = connection.execute(
             f"INSERT INTO predictions ({', '.join(_PREDICTION_COLUMNS)}) "
@@ -224,16 +230,18 @@ def list_patients(schema: str | None = None) -> list[dict[str, Any]]:
                 p.created_at,
                 COUNT(pr.id)       AS prediction_count,
                 MAX(pr.created_at) AS last_prediction_at,
+                MAX(pr.assessed_on) AS last_assessed_on,
                 (
                     SELECT latest.risk_probability FROM predictions AS latest
                     WHERE latest.patient_id = p.patient_id
-                    ORDER BY latest.created_at DESC, latest.id DESC
+                    ORDER BY latest.assessed_on DESC, latest.created_at DESC, latest.id DESC
                     LIMIT 1
                 )                  AS latest_risk
             FROM patients AS p
             LEFT JOIN predictions AS pr ON pr.patient_id = p.patient_id
             GROUP BY p.patient_id, p.name, p.notes, p.created_at
-            ORDER BY last_prediction_at DESC NULLS LAST, p.created_at DESC
+            ORDER BY last_assessed_on DESC NULLS LAST, last_prediction_at DESC NULLS LAST,
+                p.created_at DESC
             """
         ).fetchall()
     return [dict(row) for row in rows]
@@ -257,7 +265,7 @@ def get_history(
             """
             SELECT * FROM patient_history
             WHERE patient_id = %s
-            ORDER BY created_at DESC, record_id DESC
+            ORDER BY assessed_on DESC, created_at DESC, record_id DESC
             LIMIT %s
             """,
             (patient_id, int(limit)),
@@ -312,33 +320,45 @@ def save_account(
         connection.commit()
 
 
-def register_patient(
-    username: str, password_hash: str, name: str, schema: str | None = None
-) -> str:
-    """Create a new patient record and its sign-in account together; returns the id."""
-    patient_id = f"P-{os.urandom(4).hex().upper()}"
+def link_auth_patient(
+    auth_user_id: str, email: str, name: str | None, schema: str | None = None
+) -> dict[str, Any]:
+    """The account for a confirmed Supabase user, creating its patient record on first
+    sign-in (so unconfirmed sign-ups never leave empty records behind)."""
     with closing(connect(schema)) as connection:
+        row = connection.execute(
+            """
+            SELECT username, password_hash, role, patient_id, email, auth_user_id
+            FROM accounts WHERE auth_user_id = %s
+            """,
+            (auth_user_id,),
+        ).fetchone()
+        if row:
+            return dict(row)
+        patient_id = f"P-{os.urandom(4).hex().upper()}"
         try:
             connection.execute(
                 "INSERT INTO patients (patient_id, name) VALUES (%s, %s)", (patient_id, name)
             )
-            connection.execute(
+            row = connection.execute(
                 """
-                INSERT INTO accounts (username, password_hash, role, patient_id)
-                VALUES (%s, %s, 'patient', %s)
+                INSERT INTO accounts (username, role, patient_id, email, auth_user_id)
+                VALUES (%s, 'patient', %s, %s, %s)
+                RETURNING username, password_hash, role, patient_id, email, auth_user_id
                 """,
-                (username, password_hash, patient_id),
-            )
+                (email, patient_id, email, auth_user_id),
+            ).fetchone()
         except psycopg.errors.UniqueViolation as error:
-            raise ValueError("That username is already taken.") from error
+            raise ValueError("This email is already linked to another account.") from error
         connection.commit()
-    return patient_id
+    return dict(row)
 
 
 def get_account(username: str, schema: str | None = None) -> dict[str, Any] | None:
     with closing(connect(schema)) as connection:
         row = connection.execute(
-            "SELECT username, password_hash, role, patient_id FROM accounts WHERE username = %s",
+            "SELECT username, password_hash, role, patient_id, email, auth_user_id "
+            "FROM accounts WHERE username = %s",
             (username,),
         ).fetchone()
     return dict(row) if row else None
@@ -348,7 +368,7 @@ def list_accounts(schema: str | None = None) -> list[dict[str, Any]]:
     with closing(connect(schema)) as connection:
         rows = connection.execute(
             """
-            SELECT username, role, patient_id, created_at, last_login_at
+            SELECT username, role, patient_id, email, created_at, last_login_at
             FROM accounts ORDER BY role, username
             """
         ).fetchall()
@@ -386,7 +406,7 @@ def get_session(token_hash: str, schema: str | None = None) -> dict[str, Any] | 
     with closing(connect(schema)) as connection:
         row = connection.execute(
             """
-            SELECT s.username, s.expires_at, a.role, a.patient_id, p.name
+            SELECT s.username, s.expires_at, a.role, a.patient_id, a.email, p.name
             FROM sessions AS s
             JOIN accounts AS a ON a.username = s.username
             LEFT JOIN patients AS p ON p.patient_id = a.patient_id

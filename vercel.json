@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["dub1"],
+  "functions": {
+    "api.py": {
+      "maxDuration": 30,
+      "excludeFiles": "{tests/**,data/**,mlruns/**,notebooks/**,.github/**,artifacts/eda/**,app.py,db.py,Dockerfile,docker-compose.yml}"
+    }
+  }
+}

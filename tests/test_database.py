@@ -1,5 +1,8 @@
 """Unit tests for the Supabase/Postgres persistence layer (src/database.py + schema.sql)."""
 
+from contextlib import closing
+from datetime import date
+
 import pytest
 
 from src import database
@@ -121,3 +124,30 @@ def test_history_is_newest_first(db_schema):
     assert recent[0]["id"] == 2
     history = database.get_history("P-4")
     assert [row["record_id"] for row in history] == [2, 1]
+
+
+def test_test_date_defaults_to_today_and_orders_history(db_schema):
+    _save(patient_id="P-5", name="Ravi", assessed_on=date(2026, 1, 10))
+    _save(patient_id="P-5", name="Ravi")
+    _save(patient_id="P-5", name="Ravi", assessed_on=date(2025, 12, 1))
+    history = database.get_history("P-5")
+    assert [row["assessed_on"] for row in history] == [
+        date.today(), date(2026, 1, 10), date(2025, 12, 1)
+    ]
+    assert database.list_patients()[0]["last_assessed_on"] == date.today()
+
+
+def test_test_date_is_backfilled_for_older_tables(db_schema):
+    with closing(database.connect()) as connection:
+        connection.execute("ALTER TABLE predictions DROP COLUMN assessed_on CASCADE")
+        connection.commit()
+    _save_without_date = (
+        "INSERT INTO predictions (age, sex, cp, trestbps, chol, fbs, restecg, thalach, exang, "
+        "oldpeak, slope, ca, thal, prediction, risk_probability, risk_label, created_at) "
+        "VALUES (55, 1, 1, 130, 240, 0, 1, 150, 0, 1, 1, 0, 2, 0, 0.2, 'Lower', %s)"
+    )
+    with closing(database.connect()) as connection:
+        connection.execute(_save_without_date, ("2025-06-30 10:00:00+00",))
+        connection.commit()
+    database.init_db()
+    assert database.recent_predictions()[0]["assessed_on"] == date(2025, 6, 30)

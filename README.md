@@ -21,7 +21,7 @@ This project is an educational end-to-end MVP:
 Install [uv](https://docs.astral.sh/uv/) and use Python 3.11+:
 
 ```powershell
-uv sync --extra dev
+uv sync --all-extras
 uv run python -m src.train
 uv run streamlit run app.py
 ```
@@ -107,11 +107,12 @@ Open `http://127.0.0.1:8000/docs` for the interactive Swagger UI.
 | --- | --- |
 | `GET /` | Service metadata |
 | `GET /health` | Status plus training metrics (`cv_accuracy`, `data_hash`, `model_version`) |
-| `POST /predict` | Score one patient (fields have defaults and enforced ranges), **store the record**, return `record_id` + `patient_id` |
+| `POST /predict` | Score one patient (fields have defaults and enforced ranges), **store the record** with its `assessed_on` test date (default today, never in the future), return `record_id` + `patient_id` |
 | `POST /predict-batch` | Score up to 1000 patient records (stateless, not stored) |
 | `POST /predict-csv` | Upload a CSV, get a CSV back with `prediction`, `risk_probability`, `risk_label` (stateless) |
-| `POST /auth/register` | Patient self-sign-up (`username`, `password`, `name`): creates a new patient record and returns a token |
-| `POST /auth/login` | Exchange `username` + `password` (admin or patient) for a bearer token (8-hour session) |
+| `POST /auth/register` | Patient email sign-up (`email`, `password`, `name`) through Supabase Auth, which emails a confirmation link (`202`) |
+| `POST /auth/resend-confirmation` | Send the confirmation email again (`email`) |
+| `POST /auth/login` | `username` (admin) or patient email + `password` for a bearer token (8-hour session); `403` until the email is confirmed |
 | `POST /auth/logout`, `GET /auth/me` | End the session / show the account's `role` and `patient_id` |
 | `GET /me/history` 👤 | A signed-in patient's own record and history |
 | `GET /patients` 🔒 | Every stored patient with prediction counts and latest score time |
@@ -132,29 +133,48 @@ record is always saved to that patient's own ID, whatever identity the body cont
 
 The website opens on a login page with **Patient** and **Admin** tabs.
 
-- **Patients** create their own account (full name, username, password). Sign-up always
-  creates a *new* patient record, so nobody can claim an existing Patient ID and read its
-  history. Signed-in patients see **New assessment** (saved to their record) and **My history**.
-- **Admins** are created by the system owner and see **New assessment** and **Patient
-  records** for everyone, kept to the essentials: the patient list shows ID, name, number of
-  assessments, latest risk and last assessed date; a patient's record shows each assessment's
-  date, risk, result, BP, cholesterol and peak heart rate. Model metrics and service status
-  are hidden from admins (status badges appear only when something is wrong). Batch CSV
-  scoring is available through `POST /predict-csv`.
+- **Patients register with their email** through Supabase Auth. Supabase sends a
+  confirmation link and keeps the password; sign-in is refused until the link is opened.
+  The patient's record (new Patient ID, name, registration date) is created on their first
+  confirmed sign-in, so unconfirmed sign-ups never leave empty records, and nobody can claim
+  an existing Patient ID. Signed-in patients see **New assessment** (saved to their record)
+  and **My history**.
+- **Admins** sign in with a username created by the system owner and see **New assessment**
+  and **Patient records** for everyone, kept to the essentials: the patient list shows ID,
+  name, number of assessments, latest risk, last test date and registration date; a
+  patient's record shows each assessment's test date, risk, result, BP, cholesterol and peak
+  heart rate. Model metrics and service status are hidden from admins (status badges appear
+  only when something is wrong). Batch CSV scoring is available through `POST /predict-csv`.
+
+Every assessment stores the **test date** entered on the form (`predictions.assessed_on`,
+default today) separately from when it was saved (`created_at`); history, trends and "last
+test" use the test date. A patient's **registration date** is `patients.created_at`.
+
+Email sign-up settings (`.env`, see [`.env.example`](.env.example)):
+
+| Variable | Purpose |
+| --- | --- |
+| `SUPABASE_URL` | `https://<project-ref>.supabase.co` |
+| `SUPABASE_PUBLISHABLE_KEY` | Dashboard -> Project Settings -> API Keys -> **publishable** key (safe to share; never the secret key) |
+| `APP_URL` | Where the confirmation link sends patients back (default `http://localhost:8502`); add it under Authentication -> URL Configuration |
+
+Supabase's built-in email service only delivers to addresses of your Supabase organisation's
+members and is rate limited; for real patients, set up custom SMTP under
+Authentication -> Emails -> SMTP Settings.
 
 ```powershell
-uv run python -m src.auth create-admin admin                               # prompts for password
-uv run python -m src.auth create-patient-login ravi --patient-id P-1001   # login for an existing record
+uv run python -m src.auth create-admin admin          # prompts for password
 uv run python -m src.auth list-accounts
-uv run python -m src.auth delete-account ravi                             # medical record is kept
+uv run python -m src.auth delete-account someone@example.com   # medical record is kept
 ```
 
-Usernames are case-insensitive (3-64 letters, digits, `.`, `-`, `_`); passwords need at
-least 10 characters. Passwords are stored as salted scrypt hashes in `accounts`; each sign-in
+Admin usernames are case-insensitive (3-64 letters, digits, `.`, `-`, `_`); passwords need
+at least 10 characters and are stored as salted scrypt hashes in `accounts`. Each sign-in
 creates a random bearer token whose SHA-256 is kept in `sessions` and expires after 8 hours.
-Re-running `create-admin` resets that admin's password and signs it out everywhere. Databases
-created before patient logins existed have their `admins` table migrated into `accounts`
-automatically at startup (password hashes kept).
+Re-running `create-admin` resets that admin's password and signs it out everywhere. Older
+databases are migrated automatically at startup: the earlier `admins` table moves into
+`accounts` (password hashes kept), and existing assessments get a test date taken from when
+they were saved.
 
 ## Database (patients & history)
 
@@ -230,7 +250,7 @@ uv run python -m src.eda --data data\your_raw.csv --output artifacts\eda
 Outputs land in `artifacts/eda/`: `target_distribution.png`, `missing_values.png`,
 `correlation_heatmap.png`, `boxplots.png`, `scatter_trends.png`, `groupby_target.png`,
 plus `report.txt` (raw vs cleaned rows, columns with missing values, duplicate rows, target
-counts, IQR outlier counts) and `missing_values.csv`. Needs the dev extra (`uv sync --extra dev`)
+counts, IQR outlier counts) and `missing_values.csv`. Needs the dev extra (`uv sync --all-extras`)
 for matplotlib/seaborn; charts are ignored by git.
 
 ## Drift monitoring
@@ -267,6 +287,27 @@ uv run pre-commit run --all-files
 
 Continuous integration runs both commands on every push and pull request
 (`.github/workflows/ci.yml`).
+
+## Deploy the API to Vercel
+
+The FastAPI backend (`api.py`) deploys to Vercel as one serverless function.
+`[tool.vercel] entrypoint = "api:app"` in `pyproject.toml` points Vercel at it (otherwise it
+would pick `app.py`, the Streamlit site). Vercel installs only the core dependencies; training
+(`train` extra: MLflow, imbalanced-learn) and the website (`ui` extra: Streamlit) are left out,
+which keeps the bundle around 250 MB against Vercel's 500 MB limit. `vercel.json` runs the
+function in Dublin (`dub1`), next to the Supabase database, and excludes tests and data from
+the bundle. The trained model `artifacts/heart_model.joblib` is committed so the deployment can
+load it; retrain and commit it again to ship a new model version.
+
+1. Push the repository to GitHub, then on vercel.com choose **Add New -> Project** and import it.
+2. Under **Environment Variables** add `SUPABASE_DB_URL`, `DB_SCHEMA`, `SUPABASE_URL`,
+   `SUPABASE_PUBLISHABLE_KEY` and `APP_URL` (same meaning as in `.env`).
+3. Deploy, then open `https://<project>.vercel.app/health` and `/docs`.
+
+The Streamlit website cannot run on Vercel: it needs a long-running server with WebSocket
+connections. Host it on Streamlit Community Cloud, Render or Hugging Face Spaces with
+`HEART_API_URL` set to the Vercel URL, and update `APP_URL` plus the Supabase Site URL to the
+website's address.
 
 ## Docker
 

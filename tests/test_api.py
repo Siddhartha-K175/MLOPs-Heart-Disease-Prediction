@@ -1,3 +1,5 @@
+from datetime import date, timedelta
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -217,45 +219,76 @@ def test_login_rejects_wrong_password_and_unknown_user(client):
 
 def test_me_and_logout_end_the_session(client, admin_headers):
     me = client.get("/auth/me", headers=admin_headers).json()
-    assert me == {"username": "admin", "role": "admin", "patient_id": None, "name": None}
+    assert me == {
+        "username": "admin", "role": "admin", "patient_id": None, "name": None, "email": None,
+    }
     assert client.post("/auth/logout", headers=admin_headers).status_code == 200
     assert client.get("/patients", headers=admin_headers).status_code == 401
 
 
-def _register(client, username="asha", name="Asha Rao"):
+def _signed_in_patient(client, fake_supabase, email="asha@example.com", name="Asha Rao"):
+    """Register by email, confirm, then sign in; returns (session body, auth headers)."""
     response = client.post(
-        "/auth/register", json={"username": username, "password": ADMIN_PASSWORD, "name": name}
+        "/auth/register", json={"email": email, "password": ADMIN_PASSWORD, "name": name}
     )
-    assert response.status_code == 201
-    body = response.json()
+    assert response.status_code == 202
+    fake_supabase.confirm(email)
+    body = client.post("/auth/login", json={"username": email, "password": ADMIN_PASSWORD}).json()
     return body, {"Authorization": f"Bearer {body['access_token']}"}
 
 
-def test_register_signs_patient_in(client):
-    body, headers = _register(client)
+def test_register_by_email_sends_confirmation(client, fake_supabase):
+    response = client.post(
+        "/auth/register",
+        json={"email": "Asha@Example.com", "password": ADMIN_PASSWORD, "name": "Asha Rao"},
+    )
+    assert response.status_code == 202
+    assert response.json() == {"status": "confirmation_sent", "email": "asha@example.com"}
+    assert fake_supabase.sent == [("confirm", "asha@example.com")]
+
+
+def test_login_before_confirming_is_refused(client, fake_supabase):
+    client.post(
+        "/auth/register",
+        json={"email": "asha@example.com", "password": ADMIN_PASSWORD, "name": "Asha Rao"},
+    )
+    response = client.post(
+        "/auth/login", json={"username": "asha@example.com", "password": ADMIN_PASSWORD}
+    )
+    assert response.status_code == 403
+    assert "confirm your email" in response.json()["detail"]
+    resend = client.post("/auth/resend-confirmation", json={"email": "asha@example.com"})
+    assert resend.status_code == 202
+    assert fake_supabase.sent.count(("confirm", "asha@example.com")) == 2
+
+
+def test_confirmed_patient_signs_in_by_email(client, fake_supabase):
+    body, headers = _signed_in_patient(client, fake_supabase)
     assert body["role"] == "patient"
     assert body["patient_id"].startswith("P-")
     me = client.get("/auth/me", headers=headers).json()
     assert me == {
-        "username": "asha", "role": "patient", "patient_id": body["patient_id"],
-        "name": "Asha Rao",
+        "username": "asha@example.com", "role": "patient", "patient_id": body["patient_id"],
+        "name": "Asha Rao", "email": "asha@example.com",
     }
 
 
-def test_register_rejects_duplicates_and_weak_input(client):
-    _register(client)
-    duplicate = client.post(
-        "/auth/register", json={"username": "ASHA", "password": ADMIN_PASSWORD, "name": "X"}
-    )
-    assert duplicate.status_code == 409
+def test_register_rejects_duplicates_and_weak_input(client, fake_supabase):
+    payload = {"email": "asha@example.com", "password": ADMIN_PASSWORD, "name": "Asha Rao"}
+    assert client.post("/auth/register", json=payload).status_code == 202
+    assert client.post("/auth/register", json=payload).status_code == 409
     weak = client.post(
-        "/auth/register", json={"username": "ravi", "password": "short", "name": "R"}
+        "/auth/register", json={"email": "ravi@example.com", "password": "short", "name": "R"}
     )
     assert weak.status_code == 422
+    bad_email = client.post(
+        "/auth/register", json={"email": "not-an-email", "password": ADMIN_PASSWORD, "name": "R"}
+    )
+    assert bad_email.status_code == 422
 
 
-def test_patient_assessments_go_to_their_own_record(client):
-    body, headers = _register(client)
+def test_patient_assessments_go_to_their_own_record(client, fake_supabase):
+    body, headers = _signed_in_patient(client, fake_supabase)
     saved = client.post(
         "/predict", json={**VALID_PATIENT, "patient_id": "P-SOMEONE-ELSE", "name": "Mallory"},
         headers=headers,
@@ -264,16 +297,40 @@ def test_patient_assessments_go_to_their_own_record(client):
     history = client.get("/me/history", headers=headers).json()
     assert history["count"] == 1
     assert history["patient"]["name"] == "Asha Rao"  # body identity ignored
+    assert history["patient"]["created_at"]  # registration date
 
 
-def test_patient_sees_only_own_history(client, admin_headers):
+def test_test_date_is_stored_and_validated(client, fake_supabase):
+    _, headers = _signed_in_patient(client, fake_supabase)
+    client.post("/predict", json={**VALID_PATIENT, "assessed_on": "2026-03-14"}, headers=headers)
+    client.post("/predict", json=VALID_PATIENT, headers=headers)  # defaults to today
+    history = client.get("/me/history", headers=headers).json()["history"]
+    assert [row["assessed_on"] for row in history] == [date.today().isoformat(), "2026-03-14"]
+
+    future = (date.today() + timedelta(days=1)).isoformat()
+    response = client.post("/predict", json={**VALID_PATIENT, "assessed_on": future})
+    assert response.status_code == 422
+    too_old = client.post("/predict", json={**VALID_PATIENT, "assessed_on": "1850-01-01"})
+    assert too_old.status_code == 422
+
+
+def test_patient_sees_only_own_history(client, admin_headers, fake_supabase):
     client.post("/predict", json={**VALID_PATIENT, "patient_id": "P-OTHER", "name": "Ravi"})
-    _, headers = _register(client)
+    _, headers = _signed_in_patient(client, fake_supabase)
     assert client.get("/me/history", headers=headers).json()["count"] == 0
     for path in PROTECTED_ROUTES:
         assert client.get(path, headers=headers).status_code == 403
     assert client.get("/me/history", headers=admin_headers).status_code == 403
     assert client.get("/me/history").status_code == 401
+
+
+def test_admin_list_shows_registration_and_last_test_dates(client, admin_headers):
+    client.post(
+        "/predict", json={**VALID_PATIENT, "patient_id": "P-8", "assessed_on": "2026-02-01"}
+    )
+    row = client.get("/patients", headers=admin_headers).json()["patients"][0]
+    assert row["last_assessed_on"] == "2026-02-01"
+    assert row["created_at"]
 
 
 def test_invalid_token_on_predict_is_rejected(client):

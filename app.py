@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import html
 import os
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -12,7 +12,7 @@ import httpx
 import pandas as pd
 import streamlit as st
 
-from src import auth, database
+from src import auth, database, supabase_auth
 from src.advice import recommendations
 from src.model import (
     FEATURE_BOUNDS,
@@ -117,7 +117,7 @@ def _api_online() -> bool:
 
 
 def _save_locally(values: dict[str, float], identity: dict[str, str | None],
-                  row: pd.Series, model_version: str | None) -> dict:
+                  row: pd.Series, model_version: str | None, assessed_on: date) -> dict:
     """Fallback writer used when the API is down (same tables, same schema)."""
     database.init_db()
     return database.save_prediction(
@@ -126,6 +126,7 @@ def _save_locally(values: dict[str, float], identity: dict[str, str | None],
         risk_probability=float(row["risk_probability"]),
         risk_label=str(row["risk_label"]),
         model_version=model_version,
+        assessed_on=assessed_on,
         **identity,
     )
 
@@ -137,29 +138,42 @@ def _account_from(session: dict, token: str) -> dict:
         "role": session["role"],
         "patient_id": session.get("patient_id"),
         "name": session.get("name"),
+        "email": session.get("email"),
         "token": token,
     }
 
 
-def _sign_in(username: str, password: str, role: str) -> tuple[dict | None, str]:
-    """Sign in through the API, or against Supabase directly when it is down."""
+def _api_detail(error: str) -> str:
+    return error.split(": ", 1)[-1] if error.startswith("API error") else error
+
+
+def _sign_in(identifier: str, password: str, role: str) -> tuple[dict | None, str]:
+    """Sign in through the API, or directly against Supabase when it is down.
+
+    Patients use their email (checked by Supabase Auth); admins use a username.
+    """
+    wrong = "Incorrect email or password." if role == "patient" else (
+        "Incorrect username or password."
+    )
     data, error, offline = _call_api(
-        "POST", "/auth/login", {"username": username, "password": password}
+        "POST", "/auth/login", {"username": identifier, "password": password}
     )
     if data is not None:
         token = data["access_token"]
         profile, _, _ = _call_api("GET", "/auth/me", token=token)
         account = _account_from({**data, **(profile or {})}, token)
     elif not offline:
-        return None, "Incorrect username or password." if "401" in error else error
+        return None, wrong if "API error 401" in error else _api_detail(error)
     else:
         try:
-            session = auth.login(username, password)
+            session = auth.login(identifier, password)
             profile = auth.current_session(session["access_token"]) if session else None
+        except auth.SignInError as refusal:
+            return None, str(refusal)
         except (database.DatabaseError, ValueError) as local_error:
             return None, f"{error}; Supabase sign-in also failed: {local_error}"
         if session is None:
-            return None, "Incorrect username or password."
+            return None, wrong
         account = _account_from({**session, **(profile or {})}, session["access_token"])
 
     if account["role"] != role:
@@ -170,21 +184,30 @@ def _sign_in(username: str, password: str, role: str) -> tuple[dict | None, str]
     return account, ""
 
 
-def _register(username: str, password: str, name: str) -> tuple[dict | None, str]:
-    """Patient self-sign-up; signs the new patient straight in."""
+def _register(email: str, password: str, name: str) -> tuple[str | None, str]:
+    """Patient email sign-up; Supabase emails a confirmation link. Returns the email."""
     data, error, offline = _call_api(
-        "POST", "/auth/register", {"username": username, "password": password, "name": name}
+        "POST", "/auth/register", {"email": email, "password": password, "name": name}
     )
     if data is not None:
-        return _account_from({**data, "name": name.strip()}, data["access_token"]), ""
+        return data["email"], ""
     if not offline:
-        return None, error.split(": ", 1)[-1]
+        return None, _api_detail(error)
     try:
-        auth.register_patient(username, password, name)
-        session = auth.login(username, password)
-    except (database.DatabaseError, ValueError) as local_error:
+        return auth.register_patient(email, password, name), ""
+    except ValueError as local_error:
         return None, str(local_error)
-    return _account_from({**session, "name": name.strip()}, session["access_token"]), ""
+
+
+def _resend_confirmation(email: str) -> str:
+    _, error, offline = _call_api("POST", "/auth/resend-confirmation", {"email": email})
+    if offline:
+        try:
+            supabase_auth.resend_confirmation(auth.normalize_email(email))
+            error = ""
+        except (ValueError, supabase_auth.AuthError) as local_error:
+            error = str(local_error)
+    return _api_detail(error)
 
 
 def _end_session(token: str) -> None:
@@ -303,12 +326,14 @@ def _findings(values: dict[str, float]) -> list[str]:
 
 
 def _assess(values: dict[str, float], identity: dict[str, str | None],
-            metrics: dict, token: str) -> dict | None:
+            metrics: dict, token: str, assessed_on: date) -> dict | None:
     """Score through the API (or locally when it is down) and return the result to show."""
-    data, error, offline = _call_api("POST", "/predict", {**values, **identity}, token=token)
+    payload = {**values, **identity, "assessed_on": assessed_on.isoformat()}
+    data, error, offline = _call_api("POST", "/predict", payload, token=token)
     result = {
         "values": values,
         "assessed_at": datetime.now(),
+        "assessed_on": assessed_on,
         "record_id": None,
         "patient_id": None,
         "notice": "",
@@ -338,7 +363,9 @@ def _assess(values: dict[str, float], identity: dict[str, str | None],
     )
     version = metrics.get("model_version")
     try:
-        saved = _save_locally(values, identity, row, str(version) if version is not None else None)
+        saved = _save_locally(
+            values, identity, row, str(version) if version is not None else None, assessed_on
+        )
         result.update(record_id=saved["record_id"], patient_id=saved["patient_id"])
     except (database.DatabaseError, ValueError) as save_error:
         result["save_error"] = f"Could not save the record to Supabase: {save_error}"
@@ -366,12 +393,12 @@ def _render_result(result: dict) -> None:
         unsafe_allow_html=True,
     )
 
-    when = result["assessed_at"].strftime("%d %b %Y, %H:%M")
+    tested = result["assessed_on"].strftime("%d %b %Y")
     if result["record_id"] is not None:
         owner = (
             f"patient **{result['patient_id']}**" if result["patient_id"] else "an anonymous record"
         )
-        st.caption(f"Saved to {owner} · record #{result['record_id']} · {when}")
+        st.caption(f"Test date {tested} · saved to {owner} · record #{result['record_id']}")
     if result["notice"]:
         st.warning(result["notice"])
     if result["save_error"]:
@@ -415,7 +442,8 @@ def _render_record(record: dict, note: str, *, own: bool) -> None:
         return
     history = pd.DataFrame(record["history"])
     history["created_at"] = _local_times(history["created_at"])
-    history = history.sort_values("created_at", ascending=False)
+    history["assessed_on"] = pd.to_datetime(history["assessed_on"])
+    history = history.sort_values(["assessed_on", "created_at"], ascending=False)
     latest = float(history["risk_probability"].iloc[0])
     previous = float(history["risk_probability"].iloc[1]) if len(history) > 1 else None
 
@@ -425,7 +453,8 @@ def _render_record(record: dict, note: str, *, own: bool) -> None:
         if patient.get("notes") and not own:
             caption += f" · {patient['notes']}"
         st.caption(caption)
-        first, second, third = st.columns(3)
+        registered = _local_times(pd.Series([patient["created_at"]])).iloc[0]
+        first, second, third, fourth = st.columns(4)
         first.metric("Assessments", record["count"])
         second.metric(
             "Latest risk",
@@ -433,22 +462,23 @@ def _render_record(record: dict, note: str, *, own: bool) -> None:
             delta=f"{(latest - previous) * 100:+.0f} pts" if previous is not None else None,
             delta_color="inverse",
         )
-        third.metric("First assessed", history["created_at"].min().strftime("%d %b %Y"))
+        third.metric("Last test", history["assessed_on"].iloc[0].strftime("%d %b %Y"))
+        fourth.metric("Registered", registered.strftime("%d %b %Y"))
     if note:
         st.caption(note)
 
     if len(history) > 1:
-        trend = history.set_index("created_at")[["risk_probability"]] * 100
+        trend = history.set_index("assessed_on")[["risk_probability"]] * 100
         st.line_chart(
             trend.rename(columns={"risk_probability": "Risk (%)"}),
             y_label="Risk (%)", height=220,
         )
     st.dataframe(
-        history[["created_at", "risk_probability", "risk_label", "trestbps", "chol", "thalach"]],
+        history[["assessed_on", "risk_probability", "risk_label", "trestbps", "chol", "thalach"]],
         hide_index=True,
         width="stretch",
         column_config={
-            "created_at": st.column_config.DatetimeColumn("Assessed", format="D MMM YYYY, HH:mm"),
+            "assessed_on": st.column_config.DateColumn("Test date", format="D MMM YYYY"),
             "risk_probability": st.column_config.ProgressColumn(
                 "Risk", min_value=0.0, max_value=1.0, format="percent"
             ),
@@ -461,31 +491,61 @@ def _render_record(record: dict, note: str, *, own: bool) -> None:
 
 
 def _sign_in_form(role: str) -> None:
+    is_patient = role == "patient"
     with st.form(f"{role}_sign_in", border=False):
-        username = st.text_input("Username", autocomplete="username", key=f"{role}_user")
+        identifier = st.text_input(
+            "Email" if is_patient else "Username",
+            autocomplete="email" if is_patient else "username",
+            placeholder="you@example.com" if is_patient else None,
+            key=f"{role}_user",
+        )
         password = st.text_input(
             "Password", type="password", autocomplete="current-password", key=f"{role}_pass"
         )
         submitted = st.form_submit_button("Sign in", type="primary", width="stretch")
     if submitted:
-        if not username.strip() or not password:
-            st.error("Enter your username and password.")
+        if not identifier.strip() or not password:
+            st.error(f"Enter your {'email' if is_patient else 'username'} and password.")
             return
         with st.spinner("Signing in…"):
-            account, error = _sign_in(username, password, role)
+            account, error = _sign_in(identifier, password, role)
         if account:
             st.session_state["account"] = account
             st.rerun()
         st.error(error)
+        if is_patient and "confirm your email" in error:
+            st.session_state["unconfirmed_email"] = identifier.strip()
+    unconfirmed = st.session_state.get("unconfirmed_email") if is_patient else None
+    if unconfirmed and st.button("Resend confirmation email", key="resend_from_sign_in"):
+        problem = _resend_confirmation(unconfirmed)
+        if problem:
+            st.error(problem)
+        else:
+            st.success(f"We sent a new confirmation link to {unconfirmed}.")
 
 
 def _register_form() -> None:
+    sent_to = st.session_state.get("registered_email")
+    if sent_to:
+        st.success(
+            f"Check your inbox at **{sent_to}** and open the confirmation link. "
+            "Then come back and sign in on the **Sign in** tab."
+        )
+        left, right = st.columns(2)
+        if left.button("Resend email", key="resend_after_register", width="stretch"):
+            problem = _resend_confirmation(sent_to)
+            if problem:
+                st.error(problem)
+            else:
+                st.info("Sent again. It can take a minute to arrive; check your spam folder.")
+        if right.button("Use another email", key="register_again", width="stretch"):
+            st.session_state.pop("registered_email", None)
+            st.rerun()
+        return
+
     with st.form("patient_register", border=False):
         name = st.text_input("Full name", placeholder="e.g. Asha Rao")
-        username = st.text_input(
-            "Choose a username", autocomplete="username",
-            help="3–64 characters: letters, digits, '.', '-' or '_'.",
-        )
+        email = st.text_input("Email", placeholder="you@example.com", autocomplete="email")
         password = st.text_input(
             "Choose a password", type="password", autocomplete="new-password",
             help=f"At least {auth.MIN_PASSWORD_LENGTH} characters.",
@@ -497,8 +557,8 @@ def _register_form() -> None:
         submitted = st.form_submit_button("Create account", type="primary", width="stretch")
     if not submitted:
         return
-    if not name.strip() or not username.strip():
-        st.error("Enter your full name and a username.")
+    if not name.strip() or not email.strip():
+        st.error("Enter your full name and email.")
     elif len(password) < auth.MIN_PASSWORD_LENGTH:
         st.error(f"Password must be at least {auth.MIN_PASSWORD_LENGTH} characters.")
     elif password != confirm:
@@ -507,10 +567,9 @@ def _register_form() -> None:
         st.error("Please confirm you understand this is not a diagnosis.")
     else:
         with st.spinner("Creating your account…"):
-            account, error = _register(username, password, name)
-        if account:
-            st.session_state["account"] = account
-            st.session_state["welcome"] = True
+            registered, error = _register(email, password, name)
+        if registered:
+            st.session_state["registered_email"] = registered
             st.rerun()
         st.error(error)
 
@@ -537,7 +596,9 @@ def _render_login() -> None:
                     st.caption("See your saved assessments and track your risk over time.")
                     _sign_in_form("patient")
                 with register_tab:
-                    st.caption("New here? Create your patient account in a minute.")
+                    st.caption(
+                        "New here? Register with your email. We'll send a link to confirm it."
+                    )
                     _register_form()
             with admin_tab:
                 st.caption(
@@ -546,8 +607,9 @@ def _render_login() -> None:
                 )
                 _sign_in_form("admin")
         st.caption(
-            "&#128274; Passwords are stored only as salted hashes. Sessions end after "
-            f"{auth.SESSION_HOURS} hours or when you sign out."
+            "&#128274; Patient passwords are kept by Supabase Auth and admin passwords only "
+            f"as salted hashes. Sessions end after {auth.SESSION_HOURS} hours or when you "
+            "sign out."
         )
 
 
@@ -607,8 +669,9 @@ with st.sidebar:
         st.caption(f"Signed in as **{account['username']}**. All patient records are visible.")
     else:
         st.caption(
-            f"Signed in as **{account.get('name') or account['username']}** "
-            f"(`{account['username']}`)  \nPatient ID `{account['patient_id']}`"
+            f"Signed in as **{account.get('name') or account['username']}**  \n"
+            f"{account.get('email') or account['username']}  \n"
+            f"Patient ID `{account['patient_id']}`"
         )
     if st.button("Sign out", width="stretch"):
         _sign_out()
@@ -637,12 +700,6 @@ with st.sidebar:
         )
     st.warning(
         "Decision support only — not a diagnosis. Always confirm with a qualified clinician."
-    )
-
-if st.session_state.pop("welcome", False):
-    st.success(
-        f"Welcome, {account.get('name') or account['username']}! Your patient ID is "
-        f"**{account['patient_id']}**. Assessments you run are saved to your record."
     )
 
 if is_admin:
@@ -675,6 +732,13 @@ with tab_single:
                         f"Patient ID `{account['patient_id']}`"
                     )
                     patient_id = patient_name = patient_note = ""
+                test_date = st.date_input(
+                    "Test date",
+                    value=date.today(),
+                    max_value=date.today(),
+                    format="DD/MM/YYYY",
+                    help="When these measurements were taken. Defaults to today.",
+                )
 
             with st.container(border=True, key="card_vitals"):
                 _section("Symptoms & vitals", "Demographics, presenting symptoms and bloods.")
@@ -742,7 +806,7 @@ with tab_single:
             identity = {"patient_id": account["patient_id"], "name": None, "notes": None}
         ordered = {feature: values[feature] for feature in FEATURES}
         with st.spinner("Scoring and saving…"):
-            outcome = _assess(ordered, identity, metrics, account["token"])
+            outcome = _assess(ordered, identity, metrics, account["token"], test_date)
         if outcome is not None:
             st.session_state["latest_assessment"] = outcome
             if outcome["patient_id"]:
@@ -818,12 +882,13 @@ else:
                 st.caption(patients_note)
             if patients_data is not None and patients_data["patients"]:
                 directory = pd.DataFrame(patients_data["patients"])
-                directory["last_prediction_at"] = _local_times(directory["last_prediction_at"])
+                directory["created_at"] = _local_times(directory["created_at"])
+                directory["last_assessed_on"] = pd.to_datetime(directory["last_assessed_on"])
                 directory["name"] = directory["name"].fillna("")
                 st.dataframe(
                     directory[
                         ["patient_id", "name", "prediction_count", "latest_risk",
-                         "last_prediction_at"]
+                         "last_assessed_on", "created_at"]
                     ],
                     hide_index=True,
                     width="stretch",
@@ -834,8 +899,11 @@ else:
                         "latest_risk": st.column_config.ProgressColumn(
                             "Latest risk", min_value=0.0, max_value=1.0, format="percent"
                         ),
-                        "last_prediction_at": st.column_config.DatetimeColumn(
-                            "Last assessed", format="D MMM YYYY, HH:mm"
+                        "last_assessed_on": st.column_config.DateColumn(
+                            "Last test", format="D MMM YYYY"
+                        ),
+                        "created_at": st.column_config.DateColumn(
+                            "Registered", format="D MMM YYYY"
                         ),
                     },
                 )

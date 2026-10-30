@@ -58,36 +58,84 @@ CREATE TABLE IF NOT EXISTS predictions (
     risk_probability DOUBLE PRECISION NOT NULL CHECK (risk_probability BETWEEN 0 AND 1),
     risk_label       VARCHAR(120)     NOT NULL,
     model_version    VARCHAR(64)      NULL,
+    -- When the measurements were taken (entered on the form); created_at is
+    -- when the record was saved.
+    assessed_on      DATE             NOT NULL DEFAULT CURRENT_DATE,
     created_at       TIMESTAMPTZ      NOT NULL DEFAULT now()
 );
 
+-- Databases created before assessed_on existed: backfill it from created_at.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'predictions'
+          AND column_name = 'assessed_on'
+    ) THEN
+        ALTER TABLE predictions ADD COLUMN assessed_on DATE;
+        UPDATE predictions SET assessed_on = created_at::date;
+        ALTER TABLE predictions
+            ALTER COLUMN assessed_on SET DEFAULT CURRENT_DATE,
+            ALTER COLUMN assessed_on SET NOT NULL;
+    END IF;
+END;
+$$;
+
 CREATE INDEX IF NOT EXISTS idx_predictions_patient_id ON predictions (patient_id);
 CREATE INDEX IF NOT EXISTS idx_predictions_created_at ON predictions (created_at);
+CREATE INDEX IF NOT EXISTS idx_predictions_assessed_on ON predictions (assessed_on);
 
 -- Sign-in accounts. Admins read every patient record; a patient account is
--- tied to exactly one patients row and sees only that history. Passwords are
--- stored only as scrypt hashes (see src/auth.py). Admins are created with
---     uv run python -m src.auth create-admin <username>
--- and patients register themselves on the website's login page.
+-- tied to exactly one patients row and sees only that history.
+--  * Admins sign in with a username; their password is stored here only as a
+--    scrypt hash (see src/auth.py). Create them with
+--        uv run python -m src.auth create-admin <username>
+--  * Patients register by email through Supabase Auth, which confirms the
+--    address and keeps the password; auth_user_id links the Supabase user
+--    and username holds the lower-cased email.
 CREATE TABLE IF NOT EXISTS accounts (
-    username      VARCHAR(64)  PRIMARY KEY,
-    password_hash VARCHAR(255) NOT NULL,
+    username      VARCHAR(254) PRIMARY KEY,
+    password_hash VARCHAR(255) NULL,
     role          VARCHAR(16)  NOT NULL CHECK (role IN ('admin', 'patient')),
     patient_id    VARCHAR(64)  NULL UNIQUE
         REFERENCES patients (patient_id) ON DELETE CASCADE,
+    email         VARCHAR(254) NULL UNIQUE,
+    auth_user_id  UUID         NULL UNIQUE,
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
     last_login_at TIMESTAMPTZ  NULL,
     CONSTRAINT chk_accounts_patient_link CHECK ((role = 'patient') = (patient_id IS NOT NULL))
 );
 
+-- Accounts tables created before email sign-up: add the new columns.
+ALTER TABLE accounts ALTER COLUMN username TYPE VARCHAR(254);
+ALTER TABLE accounts ALTER COLUMN password_hash DROP NOT NULL;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email VARCHAR(254) NULL UNIQUE;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auth_user_id UUID NULL UNIQUE;
+
+-- Every account signs in somehow: a local password or a Supabase Auth user.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'chk_accounts_credentials'
+          AND conrelid = to_regclass('accounts')
+    ) THEN
+        ALTER TABLE accounts ADD CONSTRAINT chk_accounts_credentials
+            CHECK (password_hash IS NOT NULL OR auth_user_id IS NOT NULL);
+    END IF;
+END;
+$$;
+
 -- Signed-in sessions. Only a SHA-256 of each bearer token is stored, so a
 -- database leak does not hand out live tokens.
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash CHAR(64)    PRIMARY KEY,
-    username   VARCHAR(64) NOT NULL REFERENCES accounts (username) ON DELETE CASCADE,
+    username   VARCHAR(254) NOT NULL REFERENCES accounts (username) ON DELETE CASCADE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at TIMESTAMPTZ NOT NULL
 );
+
+ALTER TABLE sessions ALTER COLUMN username TYPE VARCHAR(254);
 
 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions (expires_at);
 
@@ -130,7 +178,8 @@ SELECT
     pr.risk_probability,
     pr.risk_label,
     pr.model_version,
-    pr.created_at
+    pr.created_at,
+    pr.assessed_on
 FROM predictions AS pr
 JOIN patients AS pt ON pt.patient_id = pr.patient_id
-ORDER BY pr.created_at DESC, pr.id DESC;
+ORDER BY pr.assessed_on DESC, pr.created_at DESC, pr.id DESC;

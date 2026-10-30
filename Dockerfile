@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir .
+    && pip install --no-cache-dir ".[ui]"
 
 COPY api.py app.py db.py schema.sql ./
 COPY artifacts ./artifacts

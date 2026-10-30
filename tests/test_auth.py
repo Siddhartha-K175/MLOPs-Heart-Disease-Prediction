@@ -25,10 +25,16 @@ def test_verify_rejects_malformed_hashes():
     assert not auth.verify_password(PASSWORD, "md5$1$1$1$abc$def")
 
 
-@pytest.mark.parametrize("bad", ["ab", "has space", "x" * 65, "-leading"])
-def test_usernames_are_validated(bad):
+@pytest.mark.parametrize("bad", ["ab", "has space", "x" * 65, "-leading", "a@b.com"])
+def test_admin_usernames_are_validated(bad):
     with pytest.raises(ValueError, match="Username"):
         auth.normalize_username(bad)
+
+
+@pytest.mark.parametrize("bad", ["", "plainaddress", "a@b", "two@@at.com", "sp ace@x.com"])
+def test_emails_are_validated(bad):
+    with pytest.raises(ValueError, match="valid email"):
+        auth.normalize_email(bad)
 
 
 def test_usernames_are_case_insensitive(db_schema):
@@ -51,47 +57,53 @@ def test_admin_login_issues_a_working_token(db_schema):
     assert current["role"] == "admin"
 
 
-def test_register_patient_creates_record_and_account(db_schema):
-    patient_id = auth.register_patient("asha", PASSWORD, "Asha Rao")
-    assert patient_id.startswith("P-")
-    assert database.get_patient(patient_id)["name"] == "Asha Rao"
-    session = auth.login("asha", PASSWORD)
+def test_register_sends_confirmation_without_creating_a_record(db_schema, fake_supabase):
+    email = auth.register_patient(" Asha@Example.com ", PASSWORD, "Asha Rao")
+    assert email == "asha@example.com"
+    assert fake_supabase.sent == [("confirm", "asha@example.com")]
+    assert database.list_patients() == []  # nothing until the patient confirms and signs in
+
+
+def test_unconfirmed_patient_cannot_sign_in(db_schema, fake_supabase):
+    auth.register_patient("asha@example.com", PASSWORD, "Asha Rao")
+    with pytest.raises(auth.SignInError, match="confirm your email"):
+        auth.login("asha@example.com", PASSWORD)
+
+
+def test_first_confirmed_sign_in_creates_patient_record(db_schema, fake_supabase):
+    auth.register_patient("asha@example.com", PASSWORD, "Asha Rao")
+    fake_supabase.confirm("asha@example.com")
+    session = auth.login("ASHA@example.com", PASSWORD)
     assert session["role"] == "patient"
-    assert session["patient_id"] == patient_id
-    assert auth.current_session(session["access_token"])["name"] == "Asha Rao"
+    assert session["email"] == "asha@example.com"
+    assert session["patient_id"].startswith("P-")
+    assert database.get_patient(session["patient_id"])["name"] == "Asha Rao"
+    current = auth.current_session(session["access_token"])
+    assert current["name"] == "Asha Rao"
+    assert current["email"] == "asha@example.com"
+
+    again = auth.login("asha@example.com", PASSWORD)
+    assert again["patient_id"] == session["patient_id"]  # same record on later sign-ins
+    assert len(database.list_patients()) == 1
 
 
-def test_register_rejects_taken_username_without_orphan_record(db_schema):
-    auth.register_patient("asha", PASSWORD, "Asha Rao")
-    with pytest.raises(ValueError, match="taken"):
-        auth.register_patient("ASHA", PASSWORD, "Someone Else")
-    assert len(database.list_patients()) == 1  # the failed sign-up left nothing behind
+def test_patient_wrong_password_returns_none(db_schema, fake_supabase):
+    auth.register_patient("asha@example.com", PASSWORD, "Asha Rao")
+    fake_supabase.confirm("asha@example.com")
+    assert auth.login("asha@example.com", "wrong password!") is None
+    assert auth.login("nobody@example.com", PASSWORD) is None
 
 
-def test_register_validates_name_and_password(db_schema):
+def test_register_validates_input(db_schema, fake_supabase):
     with pytest.raises(ValueError, match="full name"):
-        auth.register_patient("asha", PASSWORD, "   ")
+        auth.register_patient("asha@example.com", PASSWORD, "   ")
     with pytest.raises(ValueError, match="at least"):
-        auth.register_patient("asha", "short", "Asha Rao")
-
-
-def test_patient_login_for_existing_record(db_schema):
-    database.save_prediction(
-        features={"age": 55, "sex": 1, "cp": 3, "trestbps": 130, "chol": 240, "fbs": 0,
-                  "restecg": 0, "thalach": 150, "exang": 0, "oldpeak": 1.0, "slope": 2,
-                  "ca": 0, "thal": 3},
-        prediction=0, risk_probability=0.2, risk_label="Lower", patient_id="P-1", name="Ravi",
-    )
-    auth.create_patient_login("ravi", PASSWORD, "P-1")
-    assert auth.login("ravi", PASSWORD)["patient_id"] == "P-1"
-    with pytest.raises(ValueError, match="No patient"):
-        auth.create_patient_login("ghost", PASSWORD, "P-missing")
-
-
-def test_admin_and_patient_names_cannot_collide(db_schema):
-    auth.register_patient("asha", PASSWORD, "Asha Rao")
-    with pytest.raises(ValueError, match="patient account"):
-        auth.create_admin("asha", PASSWORD)
+        auth.register_patient("asha@example.com", "short", "Asha Rao")
+    with pytest.raises(ValueError, match="valid email"):
+        auth.register_patient("not-an-email", PASSWORD, "Asha Rao")
+    auth.register_patient("asha@example.com", PASSWORD, "Asha Rao")
+    with pytest.raises(ValueError, match="already exists"):
+        auth.register_patient("asha@example.com", PASSWORD, "Asha Rao")
 
 
 def test_only_the_token_hash_is_stored(db_schema):
@@ -157,12 +169,14 @@ def test_old_admin_tables_are_migrated(db_schema):
     assert leftover["n"] == 0
 
 
-def test_cli_lists_and_deletes_accounts(db_schema, capsys):
+def test_cli_lists_and_deletes_accounts(db_schema, fake_supabase, capsys):
     auth.create_admin("admin", PASSWORD)
-    patient_id = auth.register_patient("asha", PASSWORD, "Asha Rao")
+    auth.register_patient("asha@example.com", PASSWORD, "Asha Rao")
+    fake_supabase.confirm("asha@example.com")
+    patient_id = auth.login("asha@example.com", PASSWORD)["patient_id"]
     assert auth.main(["list-accounts"]) == 0
     out = capsys.readouterr().out
-    assert "admin" in out and f"asha -> {patient_id}" in out
-    assert auth.main(["delete-account", "asha"]) == 0
+    assert "admin" in out and f"asha@example.com -> {patient_id}" in out
+    assert auth.main(["delete-account", "Asha@Example.com"]) == 0
     assert database.get_patient(patient_id) is not None  # medical record kept
-    assert auth.main(["delete-account", "asha"]) == 1
+    assert auth.main(["delete-account", "asha@example.com"]) == 1

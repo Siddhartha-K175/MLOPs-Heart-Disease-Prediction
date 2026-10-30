@@ -4,6 +4,8 @@ __pycache__/
 .ruff_cache/
 artifacts/*
 !artifacts/.gitkeep
+# The trained model ships with the repo so Vercel can serve it.
+!artifacts/heart_model.joblib
 data/*
 !data/.gitkeep
 *.pyc

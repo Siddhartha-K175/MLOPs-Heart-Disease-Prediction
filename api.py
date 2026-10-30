@@ -10,7 +10,7 @@ from __future__ import annotations
 import io
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -20,7 +20,7 @@ from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, create_model
 
-from src import auth, database
+from src import auth, database, supabase_auth
 from src.advice import recommendations
 from src.model import (
     FEATURE_BOUNDS,
@@ -69,18 +69,32 @@ Patient = create_model(
         str | None,
         Field(None, max_length=500, description="Free-text clinical note stored with the patient."),
     ),
+    assessed_on=(
+        date | None,
+        Field(
+            None,
+            ge=date(1900, 1, 1),
+            description="Date the measurements were taken (default today; never in the future).",
+        ),
+    ),
 )
 
 
 class LoginRequest(BaseModel):
-    username: str = Field(..., min_length=1, max_length=64)
+    username: str = Field(
+        ..., min_length=1, max_length=254, description="Admin username, or a patient's email"
+    )
     password: str = Field(..., min_length=1, max_length=256)
 
 
 class RegisterRequest(BaseModel):
-    username: str = Field(..., min_length=3, max_length=64, description="Letters, digits, . - _")
+    email: str = Field(..., min_length=3, max_length=254)
     password: str = Field(..., min_length=auth.MIN_PASSWORD_LENGTH, max_length=256)
     name: str = Field(..., min_length=1, max_length=120, description="Patient's full name")
+
+
+class EmailRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
 
 
 class Session(BaseModel):
@@ -89,6 +103,7 @@ class Session(BaseModel):
     username: str
     role: str = Field(..., description="'admin' or 'patient'")
     patient_id: str | None = Field(None, description="Linked patient record (patients only)")
+    email: str | None = None
     expires_at: datetime
 
 
@@ -165,6 +180,7 @@ def _persist(prediction: Prediction, payload: dict, identity: dict[str, str | No
             risk_probability=prediction.risk_probability,
             risk_label=prediction.risk_label,
             model_version=prediction.model_version,
+            assessed_on=payload.get("assessed_on"),
             **identity,
         )
     except database.DatabaseError as error:
@@ -210,7 +226,8 @@ def home() -> dict[str, str]:
         "docs": "/docs",
         "endpoints": (
             "GET /health, POST /predict, POST /predict-batch, POST /predict-csv, "
-            "POST /auth/register, POST /auth/login, POST /auth/logout, GET /auth/me, "
+            "POST /auth/register, POST /auth/resend-confirmation, POST /auth/login, "
+            "POST /auth/logout, GET /auth/me, "
             "patient: GET /me/history, "
             "admin only: GET /patients, GET /patients/{patient_id}/history, GET /predictions"
         ),
@@ -267,22 +284,38 @@ def require_admin(account: OptionalAccount) -> dict:
 
 @app.post("/auth/login", response_model=Session, tags=["auth"])
 def login(credentials: LoginRequest) -> Session:
-    """Exchange a username and password (admin or patient) for a bearer token."""
-    session = auth.login(credentials.username, credentials.password)
+    """Exchange an admin username, or a patient's email, plus password for a bearer token."""
+    try:
+        session = auth.login(credentials.username, credentials.password)
+    except auth.SignInError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
     if session is None:
         raise _unauthorized("Incorrect username or password.")
     return Session(**session)
 
 
-@app.post("/auth/register", response_model=Session, status_code=201, tags=["auth"])
-def register(details: RegisterRequest) -> Session:
-    """Patient self-sign-up: creates a new patient record and signs the patient in."""
+@app.post("/auth/register", status_code=202, tags=["auth"])
+def register(details: RegisterRequest) -> dict[str, str]:
+    """Patient email sign-up through Supabase Auth, which emails a confirmation link.
+
+    The patient record is created when the patient first signs in after confirming.
+    """
     try:
-        auth.register_patient(details.username, details.password, details.name)
+        email = auth.register_patient(details.email, details.password, details.name)
     except ValueError as error:
-        status = 409 if "taken" in str(error) else 422
+        status = 409 if "already exists" in str(error) else 422
         raise HTTPException(status_code=status, detail=str(error)) from error
-    return Session(**auth.login(details.username, details.password))
+    return {"status": "confirmation_sent", "email": email}
+
+
+@app.post("/auth/resend-confirmation", status_code=202, tags=["auth"])
+def resend_confirmation(details: EmailRequest) -> dict[str, str]:
+    """Send the sign-up confirmation email again."""
+    try:
+        supabase_auth.resend_confirmation(auth.normalize_email(details.email))
+    except (ValueError, supabase_auth.AuthError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {"status": "sent"}
 
 
 @app.post("/auth/logout", tags=["auth"])
@@ -295,7 +328,7 @@ def logout(account: Account, credentials: BearerToken) -> dict[str, str]:
 @app.get("/auth/me", tags=["auth"])
 def me(account: Account) -> dict:
     """The account the token belongs to."""
-    return {key: account[key] for key in ("username", "role", "patient_id", "name")}
+    return {key: account[key] for key in ("username", "role", "patient_id", "name", "email")}
 
 
 @app.get("/me/history", tags=["history"])
@@ -319,6 +352,8 @@ def predict_single(patient: Patient, account: OptionalAccount) -> Prediction:
     identity fields in the body are ignored for them.
     """
     payload = patient.model_dump()
+    if payload["assessed_on"] and payload["assessed_on"] > date.today():
+        raise HTTPException(status_code=422, detail="assessed_on cannot be in the future.")
     scored = _score(pd.DataFrame([payload]))[0]
     scored.guidance = Guidance(
         **recommendations(float(scored.risk_probability), payload)
