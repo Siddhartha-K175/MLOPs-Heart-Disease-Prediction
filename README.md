@@ -143,8 +143,9 @@ The website opens on a login page with **Patient** and **Admin** tabs.
   and **Patient records** for everyone, kept to the essentials: the patient list shows ID,
   name, number of assessments, latest risk, last test date and registration date; a
   patient's record shows each assessment's test date, risk, result, BP, cholesterol and peak
-  heart rate. Model metrics and service status are hidden from admins (status badges appear
-  only when something is wrong). Batch CSV scoring is available through `POST /predict-csv`.
+  heart rate. Model metrics are hidden from admins, and the page header shows only the
+  CardioRisk name (no service-status tags). Batch CSV scoring is available through
+  `POST /predict-csv`.
 
 Every assessment stores the **test date** entered on the form (`predictions.assessed_on`,
 default today) separately from when it was saved (`created_at`); history, trends and "last

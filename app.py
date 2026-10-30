@@ -45,11 +45,6 @@ CSS = """
 .brand {font-size: 1.3rem; font-weight: 700; color: #1B2430; line-height: 1.2;}
 .brand .mark {color: #C8102E;}
 .brand-sub {font-size: .82rem; color: #5B6675;}
-.pills {display: flex; gap: .4rem; flex-wrap: wrap;}
-.pill {font-size: .74rem; padding: .22rem .65rem; border-radius: 999px;
-  background: #EEF2F6; color: #334155; white-space: nowrap;}
-.pill.ok::before {content: "\\25CF  "; color: #1E7B4F;}
-.pill.warn::before {content: "\\25CF  "; color: #C27C00;}
 [class*="st-key-card"] {background: #fff; border-radius: 12px;}
 [data-testid="stTextInputRootElement"], [data-testid="stNumberInputContainer"],
 [data-testid="stSelectbox"] [data-baseweb="select"] > div {
@@ -105,21 +100,6 @@ def _call_api(
         return response.json(), "", False
     except ValueError:
         return None, "API returned a non-JSON response", False
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def _api_health() -> bool:
-    # A sleeping serverless API takes several seconds to wake, so allow for it.
-    # Failures raise and are therefore not cached: the next page load checks again.
-    httpx.get(f"{API_URL}/health", timeout=20.0).raise_for_status()
-    return True
-
-
-def _api_online() -> bool:
-    try:
-        return _api_health()
-    except httpx.HTTPError:
-        return False
 
 
 def _save_locally(values: dict[str, float], identity: dict[str, str | None],
@@ -632,34 +612,14 @@ except (FileNotFoundError, ValueError) as error:
 metrics = bundle.get("metrics", {})
 account = st.session_state.get("account")
 is_admin = bool(account) and account["role"] == "admin"
-api_online = _api_online()
-pills = [
-    ("ok", "API online") if api_online else ("warn", "API offline · scoring locally"),
-    (
-        # The API holds the database connection; the site needs its own only as a fallback.
-        ("ok", f"Supabase · {database.DB_SCHEMA}")
-        if api_online or database.DB_URL
-        else ("warn", "Database not configured")
-    ),
-    ("ok", f"Model v{metrics.get('model_version', '?')}"),
-]
-if is_admin:
-    # Admins only need to hear about problems, not the service details.
-    pills = [pill for pill in pills if pill[0] == "warn"]
-if account:
-    who = account["username"] if is_admin else (account.get("name") or account["username"])
-    pills.append(("ok", f"{'Admin' if is_admin else 'Patient'} · {who}"))
 st.markdown(
-    f"""
+    """
     <div class="app-header">
       <div>
         <div class="brand"><span class="mark">&#10084;</span> CardioRisk</div>
         <div class="brand-sub">
           Coronary heart-disease risk assessment · clinical decision support
         </div>
-      </div>
-      <div class="pills">
-        {"".join(f'<span class="pill {kind}">{html.escape(text)}</span>' for kind, text in pills)}
       </div>
     </div>
     """,
