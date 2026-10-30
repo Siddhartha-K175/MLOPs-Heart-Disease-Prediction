@@ -304,23 +304,29 @@ load it; retrain and commit it again to ship a new model version.
    `SUPABASE_PUBLISHABLE_KEY` and `APP_URL` (same meaning as in `.env`).
 3. Deploy, then open `https://<project>.vercel.app/health` and `/docs`.
 
-## Deploy the website to Streamlit Community Cloud
+## Deploy the website to Render
 
-The Streamlit website cannot run on Vercel (it needs a long-running server with WebSocket
-connections), so it runs on Streamlit Community Cloud instead:
+The Streamlit website runs on Render as a Docker web service (Vercel cannot host it: it
+needs a long-running server with WebSocket connections). Render shows the page without
+host branding, unlike Streamlit Community Cloud, which adds Fork/GitHub buttons and a
+creator badge around apps from public repositories.
 
-1. On share.streamlit.io choose **Create app -> Deploy a public app from GitHub**: this
-   repository, branch `main`, main file path `website/streamlit_app.py`, Python 3.12.
-2. Under **Advanced settings -> Secrets** add `HEART_API_URL = "https://<project>.vercel.app"`.
-   That is the only setting the site needs: it scores, saves and signs users in through the
+1. On render.com choose **New -> Blueprint**, connect this repository and apply
+   [`render.yaml`](render.yaml): a free `cardiorisk` web service in Frankfurt, built from the
+   `Dockerfile`, with `HEART_API_URL` pointing at the Vercel API.
+2. That is the only setting the site needs: it scores, saves and signs users in through the
    API, so the database password never has to be stored on the website host.
-3. Set `APP_URL` on Vercel and the Supabase Auth **Site URL** to the site's
-   `https://<app>.streamlit.app` address so confirmation emails return to it.
+3. Set `APP_URL` on Vercel and the Supabase Auth **Site URL** (plus a redirect URL) to the
+   site's `https://<service>.onrender.com` address so confirmation emails return to it.
 
-`website/streamlit_app.py` copies root-level secrets into the environment and runs `app.py`;
-`website/requirements.txt` pins the website's packages from `uv.lock` (Community Cloud reads
-the dependency file next to the entrypoint first). Regenerate it after dependency changes:
+Free Render services sleep after about 15 minutes without traffic; the next visit takes
+roughly a minute while the container starts. Pushes to `main` redeploy automatically.
+
+The `Dockerfile` installs [`website/requirements.txt`](website/requirements.txt), pinned
+from `uv.lock`, so the container runs the same scikit-learn the model was trained with.
+Regenerate it after dependency changes:
 `uv export --frozen --extra ui --no-dev --no-emit-project --no-hashes -o website/requirements.txt`.
+`website/streamlit_app.py` is an alternative entrypoint for Streamlit Community Cloud.
 
 ## Docker
 

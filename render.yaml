@@ -1,0 +1,15 @@
+# Render Blueprint for the CardioRisk website (the Streamlit app in a Docker container).
+# The API stays on Vercel; the site scores, saves and signs users in through it, so it
+# needs only HEART_API_URL and never holds the database password.
+services:
+  - type: web
+    name: cardiorisk
+    runtime: docker
+    plan: free
+    region: frankfurt
+    branch: main
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: HEART_API_URL
+        value: https://cardiorisk-api.vercel.app
